@@ -191,6 +191,22 @@ Endpoints principais:
 - `GET /portfolio/positions`
 - `GET /portfolio/alerts`
 
+## Deploy de Producao
+
+Arquitetura validada para este projeto:
+
+- frontend Next.js no Vercel
+- backend FastAPI em um host Python dedicado
+
+O frontend foi preparado para Vercel, mas o backend atual nao deve ser publicado no Vercel se a expectativa for manter todas as funcionalidades operacionais. O motivo e estrutural: ele depende de SQLite local, artefatos de modelo em disco, `tensorflow`, `torch` e escrita de estado operacional, o que nao combina com o runtime serverless e efemero do Vercel.
+
+Configuracao minima do frontend em producao:
+
+- definir `NEXT_PUBLIC_API_BASE_URL` com a URL publica do backend FastAPI
+- liberar CORS no backend com `PROFIT_APP_CORS_ORIGINS=https://seu-frontend.vercel.app`
+
+Sem `NEXT_PUBLIC_API_BASE_URL`, o frontend agora falha de forma explicita em producao para evitar apontar silenciosamente para `localhost`.
+
 ## Conselheiro de Risco
 
 Abre posicoes simuladas apenas a partir de teses `simulate_long`, avalia preco atual contra stop, alvo parcial e alvo principal, e salva alertas de risco. Ele nao executa ordens reais.

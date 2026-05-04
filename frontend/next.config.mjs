@@ -1,7 +1,5 @@
-import { PHASE_DEVELOPMENT_SERVER } from "next/constants.js";
-
 /** @type {import('next').NextConfig} */
-const baseConfig = {
+const nextConfig = {
   output: "standalone",
   reactStrictMode: true,
   devIndicators: false,
@@ -10,9 +8,4 @@ const baseConfig = {
   }
 };
 
-export default function nextConfig(phase) {
-  return {
-    ...baseConfig,
-    distDir: phase === PHASE_DEVELOPMENT_SERVER ? ".next" : ".next-build"
-  };
-}
+export default nextConfig;

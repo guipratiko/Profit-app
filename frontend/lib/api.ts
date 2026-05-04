@@ -1,4 +1,6 @@
-export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
+const configuredApiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
+
+export const API_BASE_URL = configuredApiBaseUrl || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000" : "");
 
 export type Asset = {
   ticker: string;
@@ -105,6 +107,9 @@ export type RealPositionCreateInput = {
 export type RealPositionUpdateInput = RealPositionCreateInput;
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  if (!API_BASE_URL) {
+    throw new Error("Defina NEXT_PUBLIC_API_BASE_URL com a URL publica do backend FastAPI antes de publicar o frontend.");
+  }
   const response = await fetch(`${API_BASE_URL}${path}`, { ...init, cache: "no-store" });
   if (!response.ok) {
     const message = await response.text();
