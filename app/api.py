@@ -81,6 +81,28 @@ def latest_row(frame: pd.DataFrame, ticker: str, date_column: str = "created_at"
     return dataframe_records(filtered.tail(1))[0]
 
 
+def build_prediction_payload(
+    ticker: str,
+    run_id: str,
+    technical_frame: pd.DataFrame,
+    fusion_frame: pd.DataFrame,
+    paper_frame: pd.DataFrame,
+) -> dict:
+    technical_latest = latest_row(technical_frame, ticker, date_column="date")
+    fusion_latest = latest_row(fusion_frame, ticker)
+    paper_latest = latest_row(paper_frame, ticker)
+    if technical_latest is None and fusion_latest is None and paper_latest is None:
+        raise HTTPException(status_code=404, detail=f"No prediction artifacts found for {ticker}")
+    return {
+        "ticker": ticker,
+        "model_run_id": run_id,
+        "technical_prediction": technical_latest,
+        "fusion_prediction": fusion_latest,
+        "paper_signal": paper_latest,
+        "risk_notice": "Experimental paper-trading thesis only. Not financial advice.",
+    }
+
+
 class RealPositionCreateRequest(BaseModel):
     ticker: str = Field(min_length=1)
     quantity: int = Field(gt=0)
@@ -267,19 +289,38 @@ def favicon() -> Response:
 def prediction_for_ticker(ticker: str) -> dict:
     run_id = get_latest_model_run_id()
     technical = read_model_predictions(run_id, split="test")
-    technical_latest = latest_row(technical, ticker, date_column="date")
-    fusion_latest = latest_row(get_fusion_predictions(), ticker)
-    paper_latest = latest_row(get_paper_trading_signals(), ticker)
-    if technical_latest is None and fusion_latest is None and paper_latest is None:
-        raise HTTPException(status_code=404, detail=f"No prediction artifacts found for {ticker}")
-    return {
-        "ticker": ticker,
-        "model_run_id": run_id,
-        "technical_prediction": technical_latest,
-        "fusion_prediction": fusion_latest,
-        "paper_signal": paper_latest,
-        "risk_notice": "Experimental paper-trading thesis only. Not financial advice.",
-    }
+    return build_prediction_payload(
+        ticker=ticker,
+        run_id=run_id,
+        technical_frame=technical,
+        fusion_frame=get_fusion_predictions(),
+        paper_frame=get_paper_trading_signals(),
+    )
+
+
+@app.get("/predictions")
+def prediction_snapshot() -> dict:
+    run_id = get_latest_model_run_id()
+    technical = read_model_predictions(run_id, split="test")
+    fusion = get_fusion_predictions()
+    paper = get_paper_trading_signals()
+
+    predictions: list[dict] = []
+    for ticker in INITIAL_ASSETS:
+        try:
+            predictions.append(
+                build_prediction_payload(
+                    ticker=ticker,
+                    run_id=run_id,
+                    technical_frame=technical,
+                    fusion_frame=fusion,
+                    paper_frame=paper,
+                )
+            )
+        except HTTPException:
+            predictions.append({"ticker": ticker})
+
+    return {"predictions": predictions}
 
 
 @app.get("/predictions/{ticker}/explanation")

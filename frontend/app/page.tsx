@@ -409,7 +409,7 @@ export default function Page() {
     try {
       const assetsPayload = await api.assets();
       const firstTicker = preferredTicker || selectedTicker || assetsPayload.assets[0]?.ticker || "";
-      const [signals, positions, realPositions, alerts, alpha, gate, refresh, predictionPairs] = await Promise.all([
+      const [signals, positions, realPositions, alerts, alpha, gate, refresh, predictionsPayload] = await Promise.all([
         api.paperSignals(),
         api.positions(),
         api.realPositions(),
@@ -417,14 +417,11 @@ export default function Page() {
         api.alphaMetrics(),
         api.paperGate(),
         api.refreshStatus(),
-        Promise.all(
-          assetsPayload.assets.map(async (asset) => {
-            const prediction = await api.prediction(asset.ticker).catch(() => ({ ticker: asset.ticker } as PredictionPayload));
-            return [asset.ticker, prediction] as const;
-          })
-        )
+        api.predictions()
       ]);
-      const predictions = Object.fromEntries(predictionPairs);
+      const predictions = Object.fromEntries(
+        predictionsPayload.predictions.map((prediction) => [prediction.ticker, prediction] as const)
+      ) as Record<string, PredictionPayload>;
       const prices = firstTicker ? (await api.prices(firstTicker, horizonLimits[horizon]).catch(() => ({ rows: [] as PriceRow[] }))).rows : [];
       setSelectedTicker(firstTicker);
       setRealForm((current) => (

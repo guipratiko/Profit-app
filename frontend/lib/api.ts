@@ -1,4 +1,5 @@
 const configuredApiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
+const CLIENT_API_PROXY_BASE = "/api/backend";
 
 export const API_BASE_URL = configuredApiBaseUrl || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000" : "");
 
@@ -110,7 +111,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!API_BASE_URL) {
     throw new Error("Defina NEXT_PUBLIC_API_BASE_URL com a URL publica do backend FastAPI antes de publicar o frontend.");
   }
-  const response = await fetch(`${API_BASE_URL}${path}`, { ...init, cache: "no-store" });
+  const response = await fetch(`${CLIENT_API_PROXY_BASE}${path}`, { ...init, cache: "no-store" });
   if (!response.ok) {
     const message = await response.text();
     throw new Error(message || `HTTP ${response.status}`);
@@ -121,6 +122,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   assets: () => request<{ assets: Asset[] }>("/assets"),
   prices: (ticker: string, limit = 1300) => request<{ ticker: string; rows: PriceRow[] }>(`/prices/${ticker}?limit=${limit}`),
+  predictions: () => request<{ predictions: PredictionPayload[] }>("/predictions"),
   prediction: (ticker: string) => request<PredictionPayload>(`/predictions/${ticker}`),
   explanation: (ticker: string) => request<{ ticker: string; explanation: unknown }>(`/predictions/${ticker}/explanation`),
   paperSignals: () => request<{ signals: PaperSignal[] }>("/paper/signals?limit=200"),
@@ -147,7 +149,7 @@ export const api = {
 
 export function assetLogoUrl(asset?: Pick<Asset, "ticker" | "logo_url"> | null) {
   if (!asset?.ticker) return "";
-  return asset.logo_url || `${API_BASE_URL}/assets/${encodeURIComponent(asset.ticker)}/logo`;
+  return `${CLIENT_API_PROXY_BASE}/assets/${encodeURIComponent(asset.ticker)}/logo`;
 }
 
 export function parseJson<T>(text?: string | null): T | null {

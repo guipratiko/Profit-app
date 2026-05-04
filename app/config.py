@@ -1,9 +1,20 @@
+import os
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-STORAGE_DIR = PROJECT_ROOT / "storage"
-DATABASE_PATH = STORAGE_DIR / "profit_app.sqlite3"
+
+
+def _env_path(name: str, default: Path) -> Path:
+    value = os.getenv(name)
+    if not value:
+        return default
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else (PROJECT_ROOT / path)
+
+
+STORAGE_DIR = _env_path("PROFIT_APP_STORAGE_DIR", PROJECT_ROOT / "storage")
+DATABASE_PATH = _env_path("PROFIT_APP_DATABASE_PATH", STORAGE_DIR / "profit_app.sqlite3")
 
 INITIAL_ASSETS = {
     "PETR4.SA": "Petrobras PN",

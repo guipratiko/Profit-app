@@ -1,0 +1,17 @@
+.git
+.venv
+.venv311
+.vscode
+frontend/node_modules
+frontend/.next
+frontend/.next-build
+frontend/out
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+storage/raw
+storage/processed
