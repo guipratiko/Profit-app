@@ -11,10 +11,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./requirements.txt
+COPY requirements.runtime.txt ./requirements.runtime.txt
 
 RUN pip install --upgrade pip \
-    && pip install -r requirements.txt
+    && pip install -r requirements.runtime.txt
 
 COPY app ./app
 COPY storage ./storage_seed
