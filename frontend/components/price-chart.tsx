@@ -9,11 +9,13 @@ export function PriceChart({ rows }: { rows: PriceRow[] }) {
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Line"> | null>(null);
 
+  const chartHeight = () => (window.innerWidth < 640 ? 260 : 330);
+
   useEffect(() => {
     if (!containerRef.current) return;
     const chart = createChart(containerRef.current, {
       autoSize: true,
-      height: 330,
+      height: chartHeight(),
       layout: { background: { type: ColorType.Solid, color: "transparent" }, textColor: "rgba(226,232,240,0.78)" },
       grid: { vertLines: { color: "rgba(148,163,184,0.08)" }, horzLines: { color: "rgba(148,163,184,0.08)" } },
       rightPriceScale: { borderColor: "rgba(148,163,184,0.15)" },
@@ -24,7 +26,7 @@ export function PriceChart({ rows }: { rows: PriceRow[] }) {
     chartRef.current = chart;
     seriesRef.current = series;
 
-    const resize = () => chart.applyOptions({ width: containerRef.current?.clientWidth || 0 });
+    const resize = () => chart.applyOptions({ width: containerRef.current?.clientWidth || 0, height: chartHeight() });
     window.addEventListener("resize", resize);
     return () => {
       window.removeEventListener("resize", resize);
@@ -44,5 +46,5 @@ export function PriceChart({ rows }: { rows: PriceRow[] }) {
     chartRef.current?.timeScale().fitContent();
   }, [rows]);
 
-  return <div ref={containerRef} className="h-[330px] w-full overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] backdrop-blur" />;
+  return <div ref={containerRef} className="h-[260px] w-full overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] backdrop-blur sm:h-[330px]" />;
 }

@@ -774,7 +774,7 @@ export default function Page() {
             </h1>
             <p className="mt-1 text-sm text-muted-foreground">Validacao honesta antes de dinheiro real</p>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:justify-end">
             <Badge tone={state.refresh?.is_stale ? "warn" : "good"}>
               {state.refresh?.is_stale ? "Dados Atrasados" : "Dados Atualizados"}
             </Badge>
@@ -800,7 +800,7 @@ export default function Page() {
                   key={row.ticker}
                   type="button"
                   onClick={() => setSelectedTicker(row.ticker)}
-                  className="flex w-full items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.035] px-3 py-2 text-left transition-colors hover:border-emerald-300/30 hover:bg-emerald-300/[0.06]"
+                  className="flex w-full flex-col items-start gap-3 rounded-xl border border-white/10 bg-white/[0.035] px-3 py-3 text-left transition-colors hover:border-emerald-300/30 hover:bg-emerald-300/[0.06] sm:flex-row sm:items-center sm:justify-between sm:py-2"
                 >
                   <div className="flex min-w-0 items-center gap-3">
                     <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full", classifyIntentLabel(row.intentLabel) === "BUY" ? "animate-pulse bg-emerald-300 shadow-[0_0_14px_rgba(52,211,153,0.9)]" : "bg-amber-200/80")} />
@@ -809,7 +809,7 @@ export default function Page() {
                       <div className="truncate text-xs text-muted-foreground">{row.intentLabel} · {fmtPercent(row.signal?.net_expected_return, 2)}</div>
                     </div>
                   </div>
-                  <div className="text-right text-xs">
+                  <div className="w-full text-left text-xs sm:w-auto sm:text-right">
                     <div className="font-semibold text-foreground">{fmtMoney(row.entryPrice)}</div>
                     <div className="text-muted-foreground">alvo {fmtMoney(row.targetPrice)}</div>
                   </div>
@@ -910,7 +910,7 @@ export default function Page() {
                         <div className="mt-1 text-xs text-muted-foreground">Retorno no intervalo: <PriceDelta rows={state.prices} /></div>
                       </div>
                     </div>
-                    <div className="flex rounded-xl border border-white/10 bg-white/5 p-1 backdrop-blur">
+                    <div className="flex self-start rounded-xl border border-white/10 bg-white/5 p-1 backdrop-blur sm:self-auto">
                       {(["7d", "3m", "5y"] as Horizon[]).map((value) => (
                         <Button key={value} size="sm" variant={horizon === value ? "default" : "quiet"} onClick={() => setHorizon(value)}>{value}</Button>
                       ))}
@@ -1015,7 +1015,7 @@ export default function Page() {
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <GateChart gates={state.gate?.gates || {}} />
-                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
                     <div><div className="text-xs text-muted-foreground">Trades fechados</div><div className="font-semibold">{state.gate?.metrics?.closed_trades ?? 0}</div></div>
                     <div><div className="text-xs text-muted-foreground">Sharpe</div><div className="font-semibold">{fmtNumber(state.gate?.metrics?.sharpe_net, 2)}</div></div>
                     <div><div className="text-xs text-muted-foreground">Drawdown</div><div className="font-semibold">{fmtPercent(state.gate?.metrics?.max_drawdown, 1)}</div></div>
@@ -1044,11 +1044,11 @@ export default function Page() {
                         {filteredInvestmentRows.length} de {investmentRows.length} ativos monitorados · {openInvestmentCount} em carteira
                       </div>
                     </div>
-                    <div className="flex flex-wrap items-center justify-end gap-2">
+                    <div className="flex w-full flex-col items-start gap-2 sm:w-auto sm:items-end">
                       <div className="flex items-center gap-1.5 text-xs uppercase tracking-wider text-muted-foreground">
                         <Filter className="h-3.5 w-3.5" /> Filtro
                       </div>
-                      <div className="flex flex-wrap gap-1.5">
+                      <div className="flex w-full gap-1.5 overflow-x-auto pb-1 scrollbar-thin sm:w-auto sm:flex-wrap sm:overflow-visible sm:pb-0">
                         {INTENT_FILTERS.map((filter) => (
                           <button
                             key={filter.value}
@@ -1068,7 +1068,67 @@ export default function Page() {
                       </div>
                     </div>
                   </CardHeader>
-                  <CardContent className="overflow-x-auto scrollbar-thin p-0">
+                  <CardContent className="p-0">
+                    {filteredInvestmentRows.length === 0 && <div className="p-6 text-sm text-muted-foreground">Nenhum ativo neste filtro.</div>}
+                    {filteredInvestmentRows.length > 0 && (
+                      <div className="space-y-3 p-4 lg:hidden">
+                        {filteredInvestmentRows.map((row) => (
+                          <button
+                            key={row.ticker}
+                            type="button"
+                            onClick={() => setSelectedTicker(row.ticker)}
+                            className={cn(
+                              "w-full rounded-2xl border border-white/10 bg-white/[0.03] p-4 text-left transition-colors hover:border-white/20 hover:bg-white/[0.05]",
+                              selectedTicker === row.ticker && "ring-glow border-sky-400/35"
+                            )}
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="flex min-w-0 items-center gap-3">
+                                <AssetLogo asset={row.asset} size="sm" />
+                                <div className="min-w-0">
+                                  <div className="font-medium">{row.ticker}</div>
+                                  <div className="truncate text-xs text-muted-foreground">{row.name}</div>
+                                </div>
+                              </div>
+                              <Badge tone={row.intentTone}>{row.intentLabel}</Badge>
+                            </div>
+                            <div className="mt-3 flex flex-wrap items-center gap-2">
+                              <Badge tone={row.statusTone}>{row.statusLabel}</Badge>
+                              <span className="text-xs text-muted-foreground">{row.reviewLabel}</span>
+                            </div>
+                            <div className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
+                              <div>
+                                <div className="text-xs text-muted-foreground">Quando</div>
+                                <div className="mt-1 font-medium text-foreground">{row.whenLabel}</div>
+                              </div>
+                              <div>
+                                <div className="text-xs text-muted-foreground">Horario</div>
+                                <div className="mt-1 font-medium text-foreground">{row.timeLabel}</div>
+                              </div>
+                            </div>
+                            <div className="mt-3 rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                              <div className="text-xs uppercase tracking-wider text-muted-foreground">Motivo</div>
+                              <div className="mt-2 text-sm leading-6 text-foreground">{row.reasonLabel}</div>
+                            </div>
+                            <div className="mt-3 grid grid-cols-3 gap-2 text-xs text-muted-foreground">
+                              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-2">
+                                <div>Entrada</div>
+                                <div className="mt-1 font-medium text-foreground">{fmtMoney(row.entryPrice)}</div>
+                              </div>
+                              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-2">
+                                <div>Stop</div>
+                                <div className="mt-1 font-medium text-foreground">{fmtMoney(row.trailingStop ?? row.stopLoss)}</div>
+                              </div>
+                              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-2">
+                                <div>Alvo</div>
+                                <div className="mt-1 font-medium text-foreground">{fmtMoney(row.targetPrice)}</div>
+                              </div>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <div className="hidden overflow-x-auto scrollbar-thin lg:block">
                     <table className="w-full min-w-[1180px] border-collapse text-sm">
                       <thead className="bg-white/[0.04] text-[11px] uppercase tracking-wider text-muted-foreground">
                         <tr>
@@ -1121,7 +1181,7 @@ export default function Page() {
                         })}
                       </tbody>
                     </table>
-                    {filteredInvestmentRows.length === 0 && <div className="p-6 text-sm text-muted-foreground">Nenhum ativo neste filtro.</div>}
+                    </div>
                   </CardContent>
                 </Card>
 
@@ -1141,7 +1201,7 @@ export default function Page() {
                             <div className="text-lg font-semibold">{selectedInvestment.name}</div>
                             <div className="mt-1 text-xs text-muted-foreground">{selectedInvestment.reviewLabel}</div>
                           </div>
-                          <div className="grid grid-cols-2 gap-3 text-sm">
+                          <div className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
                             <div><div className="text-xs text-muted-foreground">Acao</div><div className="font-semibold">{selectedInvestment.intentLabel}</div></div>
                             <div><div className="text-xs text-muted-foreground">Estado</div><div className="font-semibold">{selectedInvestment.statusLabel}</div></div>
                             <div><div className="text-xs text-muted-foreground">Quando</div><div className="font-semibold">{selectedInvestment.whenLabel}</div></div>
@@ -1180,7 +1240,7 @@ export default function Page() {
                       <Badge tone={badgeTone(selectedSignal?.operational_action || selectedSignal?.decision)}>{selectedTicker || "-"}</Badge>
                     </CardHeader>
                     <CardContent className="space-y-4 text-sm">
-                      <div className="grid grid-cols-2 gap-3">
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                         <div><div className="text-xs text-muted-foreground">Prob. ganho</div><div className="font-semibold">{fmtPercent(selectedSignal?.probability_win, 1)}</div></div>
                         <div><div className="text-xs text-muted-foreground">Retorno esperado</div><div className="font-semibold">{fmtPercent(selectedSignal?.net_expected_return, 2)}</div></div>
                         <div><div className="text-xs text-muted-foreground">Qtd sugerida</div><div className="font-semibold">{selectedSignal?.max_shares ?? "-"}</div></div>
@@ -1205,7 +1265,7 @@ export default function Page() {
                         Posicoes manuais com edicao direta na linha e atualizacao pelo ultimo fechamento disponivel.
                       </div>
                     </div>
-                    <div className="flex flex-wrap items-center justify-end gap-2">
+                    <div className="flex w-full flex-col items-start gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
                       <Badge tone="info">{realPortfolioSummary.count}</Badge>
                       <Button size="sm" onClick={() => openRealPositionModal()} disabled={busyRealSave}>
                         <Plus className="h-3.5 w-3.5" /> Cadastrar Entrada
@@ -1215,7 +1275,88 @@ export default function Page() {
                       </Button>
                     </div>
                   </CardHeader>
-                  <CardContent className="space-y-4 overflow-x-auto scrollbar-thin p-0">
+                  <CardContent className="p-0">
+                    {filteredRealPortfolioRows.length === 0 && <div className="p-6 text-sm text-muted-foreground">Nenhuma posicao real neste filtro.</div>}
+                    {filteredRealPortfolioRows.length > 0 && (
+                      <div className="space-y-3 p-4 lg:hidden">
+                        {filteredRealPortfolioRows.map((row) => {
+                          const intent = investmentRows.find((entry) => entry.ticker === row.position.ticker);
+                          return (
+                            <div
+                              key={row.position.position_id}
+                              onClick={() => setSelectedTicker(row.position.ticker)}
+                              className={cn(
+                                "rounded-2xl border border-white/10 bg-white/[0.03] p-4 transition-colors hover:border-white/20 hover:bg-white/[0.05]",
+                                selectedTicker === row.position.ticker && "ring-glow border-sky-400/35"
+                              )}
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="flex min-w-0 items-center gap-3">
+                                  <AssetLogo asset={row.asset} size="sm" />
+                                  <div className="min-w-0">
+                                    <div className="font-medium">{row.position.ticker}</div>
+                                    <div className="truncate text-xs text-muted-foreground">{row.assetName}</div>
+                                  </div>
+                                </div>
+                                <Badge tone={intent?.intentTone || row.intentTone}>{intent?.intentLabel || row.intentLabel}</Badge>
+                              </div>
+                              <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
+                                <div>
+                                  <div className="text-xs text-muted-foreground">Quantidade</div>
+                                  <div className="mt-1 font-medium">{row.position.quantity}</div>
+                                </div>
+                                <div>
+                                  <div className="text-xs text-muted-foreground">Compra</div>
+                                  <div className="mt-1 font-medium">{fmtMoney(row.position.entry_price)}</div>
+                                </div>
+                                <div>
+                                  <div className="text-xs text-muted-foreground">Atual</div>
+                                  <div className="mt-1 font-medium">{fmtMoney(row.position.current_price)}</div>
+                                </div>
+                                <div>
+                                  <div className="text-xs text-muted-foreground">P/L</div>
+                                  <div className={cn("mt-1 font-medium", Number(row.position.unrealized_pnl || 0) >= 0 ? "text-emerald-300" : "text-rose-300")}>{fmtMoney(row.position.unrealized_pnl)}</div>
+                                </div>
+                              </div>
+                              <div className="mt-3 rounded-xl border border-white/10 bg-white/[0.03] p-3 text-sm">
+                                <div className="text-xs uppercase tracking-wider text-muted-foreground">Quando revisar</div>
+                                <div className="mt-2 font-medium text-foreground">{intent?.whenLabel || row.whenLabel}</div>
+                                <div className="mt-1 text-xs text-muted-foreground">{intent?.timeLabel || row.timeLabel}</div>
+                              </div>
+                              <div className="mt-3 rounded-xl border border-white/10 bg-white/[0.03] p-3 text-sm">
+                                <div className="text-xs uppercase tracking-wider text-muted-foreground">Observacao</div>
+                                <div className="mt-2 leading-6 text-foreground">{intent?.reasonLabel || row.reasonLabel}</div>
+                              </div>
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  disabled={busyRealSave}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    openRealPositionModal(row.position);
+                                  }}
+                                >
+                                  <Edit3 className="h-3.5 w-3.5" /> Editar
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="danger"
+                                  disabled={busyRealDeleteId === row.position.position_id}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void removeRealPortfolioPosition(row.position.position_id);
+                                  }}
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" /> Excluir
+                                </Button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                    <div className="hidden overflow-x-auto scrollbar-thin lg:block">
                     <table className="w-full min-w-[1260px] border-collapse text-sm">
                       <thead className="bg-white/[0.04] text-[11px] uppercase tracking-wider text-muted-foreground">
                         <tr>
@@ -1371,7 +1512,7 @@ export default function Page() {
                         })}
                       </tbody>
                     </table>
-                    {filteredRealPortfolioRows.length === 0 && <div className="p-6 text-sm text-muted-foreground">Nenhuma posicao real neste filtro.</div>}
+                    </div>
                   </CardContent>
                 </Card>
 

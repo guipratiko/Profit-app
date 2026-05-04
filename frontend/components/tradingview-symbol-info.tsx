@@ -13,7 +13,7 @@ export function TradingViewSymbolInfo({ ticker, name }: TradingViewSymbolInfoPro
   const baseTicker = tradingViewBaseTicker(ticker);
 
   return (
-    <div className="min-h-[282px] overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] p-4 backdrop-blur">
+    <div className="min-h-[240px] overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] p-4 backdrop-blur sm:min-h-[282px]">
       <div className="flex h-full flex-col justify-between gap-4" aria-label={`TradingView links for ${name}`}>
         <div className="space-y-3">
           <div className="inline-flex items-center gap-2 rounded-full border border-sky-400/20 bg-sky-400/10 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.24em] text-sky-100">
