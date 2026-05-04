@@ -60,12 +60,47 @@ class SizingDecision:
     block_reason: str | None
 
 
+def clamp_probability(probability: float) -> float:
+    return float(max(0.0, min(1.0, float(probability))))
+
+
+def decisive_win_probability(probability_win: float, probability_loss: float | None = None) -> float:
+    p_win = clamp_probability(probability_win)
+    if probability_loss is None:
+        return p_win
+
+    p_loss = clamp_probability(probability_loss)
+    decisive_mass = p_win + p_loss
+    if decisive_mass <= 1e-9:
+        return p_win
+    return float(p_win / decisive_mass)
+
+
 def kelly_fraction(probability_win: float, win_loss_ratio: float) -> float:
     """Standard Kelly: f* = p - (1-p)/b, where b = win/loss ratio."""
     if win_loss_ratio <= 0:
         return 0.0
-    p = max(0.0, min(1.0, float(probability_win)))
+    p = clamp_probability(probability_win)
     return float(p - (1.0 - p) / float(win_loss_ratio))
+
+
+def timeout_adjusted_kelly_fraction(
+    probability_win: float,
+    probability_loss: float | None,
+    win_loss_ratio: float,
+) -> float:
+    if probability_loss is None:
+        return kelly_fraction(probability_win, win_loss_ratio)
+
+    p_win = clamp_probability(probability_win)
+    p_loss = clamp_probability(probability_loss)
+    decisive_mass = p_win + p_loss
+    if decisive_mass <= 1e-9:
+        return 0.0
+
+    # Timeout is a neutral outcome in the trade-outcome model, so size on the
+    # decisive win/loss odds and discount by the decisive mass.
+    return float(kelly_fraction(decisive_win_probability(p_win, p_loss), win_loss_ratio) * decisive_mass)
 
 
 def atr_stop_price(entry_price: float, atr: float, multiplier: float = DEFAULT_ATR_STOP_MULTIPLIER) -> float:
@@ -80,6 +115,7 @@ def size_position(
     entry_price: float,
     atr: float,
     probability_win: float,
+    probability_loss: float | None = None,
     expected_payoff: float,        # expected upside if win (e.g. target_distance)
     expected_loss: float,          # expected downside if loss (positive number, e.g. stop_distance)
     ticker: str,
@@ -103,9 +139,10 @@ def size_position(
     if per_share_risk <= 0:
         return SizingDecision(0, 0.0, 0.0, stop_price, 0.0, 0.0, [], "stop_price_invalid")
 
-    # Kelly edge — uses payoff/loss ratio derived from the trade-outcome model.
+    # Kelly edge — when the model has win/loss/timeout outcomes, treat timeout
+    # as neutral rather than as an implicit loss.
     win_loss_ratio = float(expected_payoff) / max(float(expected_loss), 1e-9)
-    raw_kelly = kelly_fraction(probability_win, win_loss_ratio)
+    raw_kelly = timeout_adjusted_kelly_fraction(probability_win, probability_loss, win_loss_ratio)
     if raw_kelly < min_kelly_edge:
         return SizingDecision(
             0, 0.0, 0.0, stop_price,

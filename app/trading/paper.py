@@ -26,7 +26,7 @@ from app.models.fusion import calculate_fused_score, choose_context_for_signal
 from app.models.registry import get_best_current_schema_model_run_id
 from app.trading.costs import apply_costs_to_gross_return, compute_cost_breakdown
 from app.trading.regime import assess_regime, estimate_volatility_percentile
-from app.trading.sizing import size_position, sector_for
+from app.trading.sizing import decisive_win_probability, size_position, sector_for
 
 
 PAPER_SIGNAL_VERSION = "v8_b3_kelly_regime_gate"
@@ -34,6 +34,7 @@ STRICT_NO_OPERATE_VOL_PERCENTILE = 0.80
 STRICT_NO_OPERATE_DIVERGENCE = 0.35
 EVENT_RECENCY_DAYS = 2
 ATR_WINDOW = 14
+REWARD_RISK_TOLERANCE = 1e-9
 
 OPERATIONAL_ACTION_ENTER_LONG = "ENTER_LONG"
 OPERATIONAL_ACTION_WATCHLIST = "WATCHLIST"
@@ -268,7 +269,7 @@ def choose_decision(
         block_reasons.append("confidence_below_minimum")
     if net_expected_return <= 0:
         block_reasons.append("net_expected_return_not_positive")
-    if reward_risk_ratio < policy.min_reward_risk_ratio:
+    if reward_risk_ratio < (policy.min_reward_risk_ratio - REWARD_RISK_TOLERANCE):
         block_reasons.append("reward_risk_below_minimum")
     if volatility_21d > policy.max_volatility_21d:
         block_reasons.append("volatility_above_limit")
@@ -509,19 +510,20 @@ def choose_operational_action(
     downstream consumers (paper_positions, risk_advisor) keep working.
     """
     block_reasons: list[str] = list(strict_block_reasons or [])
+    effective_probability_win = decisive_win_probability(probability_win, probability_loss)
     if policy.require_strategy_edge and not strategy_gate_passed:
         block_reasons.append(strategy_gate_reason or "strategy_gate_failed")
     if max_shares <= 0:
         block_reasons.append("position_size_zero")
     if volatility_21d > policy.max_volatility_21d:
         block_reasons.append("volatility_above_limit")
-    if reward_risk_ratio < policy.min_reward_risk_ratio:
+    if reward_risk_ratio < (policy.min_reward_risk_ratio - REWARD_RISK_TOLERANCE):
         block_reasons.append("reward_risk_below_minimum")
 
     win_minus_loss = probability_win - probability_loss
     enter_long_ok = (
         not block_reasons
-        and probability_win >= enter_long_min_probability_win
+        and effective_probability_win >= enter_long_min_probability_win
         and net_expected_return > 0.0
         and win_minus_loss >= enter_long_min_edge
     )
@@ -529,7 +531,7 @@ def choose_operational_action(
         return OPERATIONAL_ACTION_ENTER_LONG, "simulate_long", None
 
     if not block_reasons:
-        if probability_win < enter_long_min_probability_win:
+        if effective_probability_win < enter_long_min_probability_win:
             block_reasons.append("probability_win_below_enter_threshold")
         if net_expected_return <= 0.0:
             block_reasons.append("net_expected_return_not_positive")
@@ -537,7 +539,7 @@ def choose_operational_action(
             block_reasons.append("win_minus_loss_edge_below_minimum")
 
     watchlist_ok = (
-        probability_win >= watchlist_min_probability_win
+        effective_probability_win >= watchlist_min_probability_win
         and net_expected_return > -policy.total_execution_drag
     )
     operational_action = (
@@ -625,6 +627,7 @@ def build_trade_outcome_paper_signals(
             entry_price=reference_price,
             atr=atr,
             probability_win=probability_win,
+            probability_loss=probability_loss,
             expected_payoff=target_distance,
             expected_loss=preliminary_stop_distance,
             ticker=ticker,
@@ -860,6 +863,7 @@ def build_technical_fallback_paper_signals(
             entry_price=reference_price,
             atr=atr,
             probability_win=probability_win,
+            probability_loss=probability_loss,
             expected_payoff=target_distance,
             expected_loss=preliminary_stop_distance,
             ticker=ticker,

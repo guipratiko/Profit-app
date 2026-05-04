@@ -179,7 +179,7 @@ function badgeTone(value?: string | null): Tone {
 function actionLabel(action?: string | null) {
   if (!action) return "N/A";
   if (action === "ENTER_LONG") return "Comprar";
-  if (action === "WATCHLIST") return "Manter";
+  if (action === "WATCHLIST") return "Observar";
   if (action === "NO_TRADE") return "Nao operar";
   return action.replaceAll("_", " ");
 }
