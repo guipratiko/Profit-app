@@ -347,8 +347,13 @@ def _apply_paper_signal_migrations(connection: sqlite3.Connection) -> None:
 
 def get_connection(database_path: Path = DATABASE_PATH) -> sqlite3.Connection:
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database_path)
+    connection = sqlite3.connect(database_path, timeout=30.0)
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
     return connection
 
 

@@ -137,6 +137,15 @@ type DashboardState = {
   refresh: Record<string, unknown> | null;
 };
 
+type RefreshJob = {
+  job_id?: string | null;
+  status?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  error?: string | null;
+  result?: Record<string, unknown> | null;
+};
+
 const horizonLimits: Record<Horizon, number> = { "7d": 7, "3m": 90, "5y": 1260 };
 
 function toLocalDateTimeInputValue(date = new Date()) {
@@ -243,6 +252,20 @@ function formatReason(reason?: string | null, fallback = "Sem bloqueios ativos")
   const tokens = reasonTokens(reason);
   if (!tokens.length) return fallback;
   return tokens.map((token) => REASON_LABELS[token.toLowerCase()] || token.replaceAll("_", " ")).join(" · ");
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function readRefreshJob(refresh: Record<string, unknown> | null): RefreshJob | null {
+  if (!refresh) return null;
+  const candidate = refresh["refresh_job"];
+  return candidate && typeof candidate === "object" ? (candidate as RefreshJob) : null;
+}
+
+function settledValue<T>(result: PromiseSettledResult<T>, fallback: T): T {
+  return result.status === "fulfilled" ? result.value : fallback;
 }
 
 function horizonLabel(signal?: PaperSignal | null, alertMeta?: Record<string, any> | null) {
@@ -373,6 +396,7 @@ export default function Page() {
   const [horizon, setHorizon] = useState<Horizon>("3m");
   const [investmentIntentFilter, setInvestmentIntentFilter] = useState<IntentFilter>("ALL");
   const [loading, setLoading] = useState(true);
+  const [busyRefresh, setBusyRefresh] = useState(false);
   const [busyAudit, setBusyAudit] = useState(false);
   const [busyRealSave, setBusyRealSave] = useState(false);
   const [busyRealRefresh, setBusyRealRefresh] = useState(false);
@@ -408,19 +432,29 @@ export default function Page() {
     setError(null);
     try {
       const assetsPayload = await api.assets();
+      const refresh = await api.refreshStatus();
+      const refreshJob = readRefreshJob(refresh);
+      const refreshRunning = refreshJob?.status === "running";
       const firstTicker = preferredTicker || selectedTicker || assetsPayload.assets[0]?.ticker || "";
-      const [signals, positions, realPositions, alerts, alpha, gate, refresh, predictionsPayload] = await Promise.all([
+      const [signals, positions, realPositions, alerts, alpha, gate, predictionsPayload] = await Promise.allSettled([
         api.paperSignals(),
         api.positions(),
         api.realPositions(),
         api.alerts(),
-        api.alphaMetrics(),
-        api.paperGate(),
-        api.refreshStatus(),
+        refreshRunning ? Promise.resolve(state.alpha || null) : api.alphaMetrics(),
+        refreshRunning ? Promise.resolve(state.gate || null) : api.paperGate(),
         api.predictions()
       ]);
+
+      const signalsPayload = settledValue(signals, { signals: state.signals });
+      const positionsPayload = settledValue(positions, { positions: state.positions });
+      const realPositionsPayload = settledValue(realPositions, { positions: state.realPositions });
+      const alertsPayload = settledValue(alerts, { alerts: state.alerts });
+      const alphaPayload = settledValue(alpha, state.alpha);
+      const gatePayload = settledValue(gate, state.gate);
+      const predictionsResult = settledValue(predictionsPayload, { predictions: Object.values(state.predictions) });
       const predictions = Object.fromEntries(
-        predictionsPayload.predictions.map((prediction) => [prediction.ticker, prediction] as const)
+        predictionsResult.predictions.map((prediction) => [prediction.ticker, prediction] as const)
       ) as Record<string, PredictionPayload>;
       const prices = firstTicker ? (await api.prices(firstTicker, horizonLimits[horizon]).catch(() => ({ rows: [] as PriceRow[] }))).rows : [];
       setSelectedTicker(firstTicker);
@@ -433,18 +467,48 @@ export default function Page() {
         assets: assetsPayload.assets,
         predictions,
         prices,
-        signals: signals.signals,
-        positions: positions.positions,
-        realPositions: realPositions.positions,
-        alerts: alerts.alerts,
-        alpha,
-        gate,
+        signals: signalsPayload.signals,
+        positions: positionsPayload.positions,
+        realPositions: realPositionsPayload.positions,
+        alerts: alertsPayload.alerts,
+        alpha: alphaPayload,
+        gate: gatePayload,
         refresh
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Falha ao carregar dados");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function refreshMarketData() {
+    setBusyRefresh(true);
+    setError(null);
+    try {
+      await api.refreshRun({ maxStalenessDays: 0, refitWindowDays: 180, asyncMode: true });
+
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const refresh = await api.refreshStatus();
+        setState((current) => ({ ...current, refresh }));
+        const job = readRefreshJob(refresh);
+        const isStale = Boolean(refresh.is_stale);
+
+        if (job?.status === "failed") {
+          throw new Error(job.error || "Falha ao sincronizar mercado");
+        }
+        if ((job?.status === "completed" || job?.status === "idle" || !job?.status) && !isStale) {
+          break;
+        }
+
+        await sleep(3000);
+      }
+
+      await loadDashboard(selectedTicker);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Falha ao atualizar mercado");
+    } finally {
+      setBusyRefresh(false);
     }
   }
 
@@ -778,7 +842,10 @@ export default function Page() {
             <Badge tone={state.refresh?.is_stale ? "warn" : "good"}>
               {state.refresh?.is_stale ? "Dados Atrasados" : "Dados Atualizados"}
             </Badge>
-            <Button onClick={() => void loadDashboard()} variant="secondary"><RefreshCw className="h-4 w-4" /> Atualizar</Button>
+            <Button onClick={() => void refreshMarketData()} variant="secondary" disabled={busyRefresh || loading}>
+              <RefreshCw className={cn("h-4 w-4", busyRefresh && "animate-spin")} />
+              {busyRefresh ? "Sincronizando" : "Atualizar"}
+            </Button>
             <Button onClick={() => void auditConselheiro()} disabled={busyAudit}><ShieldCheck className="h-4 w-4" /> Conselheiro</Button>
           </div>
         </header>

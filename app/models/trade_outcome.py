@@ -39,7 +39,7 @@ except ImportError:  # pragma: no cover - import-time fallback
     log_loss = None  # type: ignore[assignment]
     SKLEARN_AVAILABLE = False
 
-from app.config import STORAGE_DIR
+from app.config import STORAGE_DIR, resolve_artifact_dir
 from app.data.database import (
     get_trade_outcome_runs,
     initialize_database,
@@ -232,7 +232,7 @@ def load_trade_outcome_artifacts(run_id: str, prefer_recent: bool = True):
     sub = runs[runs["run_id"] == run_id]
     if sub.empty:
         raise ValueError(f"Trade outcome run not found: {run_id}")
-    artifact_dir = Path(str(sub.iloc[0]["artifact_path"]))
+    artifact_dir = resolve_artifact_dir(str(sub.iloc[0]["artifact_path"]))
     classifier_path = artifact_dir / "classifier.joblib"
     regressor_path = artifact_dir / "regressor.joblib"
     if prefer_recent:

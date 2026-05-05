@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from app.config import INITIAL_ASSETS
+from app.config import INITIAL_ASSETS, resolve_artifact_dir
 from app.data.database import (
     get_price_counts,
     get_trade_outcome_runs,
@@ -177,7 +177,7 @@ def refit_trade_outcome_head(
     sub = runs[runs["run_id"] == target_run_id]
     if sub.empty:
         return {"status": "skipped", "reason": f"unknown_run_id:{target_run_id}"}
-    artifact_dir = Path(str(sub.iloc[0]["artifact_path"]))
+    artifact_dir = resolve_artifact_dir(str(sub.iloc[0]["artifact_path"]))
     metadata_path = artifact_dir / "metadata.json"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 
@@ -286,6 +286,13 @@ def run_refresh_pipeline(
         actions["direction_inference"] = run_current_inference()
     except Exception as exc:  # pragma: no cover - direction inference optional
         actions["direction_inference_error"] = str(exc)
+
+    try:
+        from app.models.fusion import run_fusion_predictions
+
+        actions["fusion_predictions"] = run_fusion_predictions()
+    except Exception as exc:  # pragma: no cover
+        actions["fusion_predictions_error"] = str(exc)
 
     try:
         from app.models.trade_outcome import run_trade_outcome_inference

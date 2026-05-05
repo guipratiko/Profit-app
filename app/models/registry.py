@@ -5,12 +5,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from app.config import resolve_artifact_dir
 from app.data.database import get_backtest_runs, get_latest_model_run_id, get_model_runs
 from app.models.tensorflow_direction import FEATURE_COLUMNS
 
 
 def read_scaler_feature_columns(artifact_path: str) -> list[str]:
-    scaler_path = Path(artifact_path) / "scaler.json"
+    scaler_path = resolve_artifact_dir(artifact_path) / "scaler.json"
     if not scaler_path.exists():
         return []
     payload = json.loads(scaler_path.read_text(encoding="utf-8"))

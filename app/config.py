@@ -16,6 +16,18 @@ def _env_path(name: str, default: Path) -> Path:
 STORAGE_DIR = _env_path("PROFIT_APP_STORAGE_DIR", PROJECT_ROOT / "storage")
 DATABASE_PATH = _env_path("PROFIT_APP_DATABASE_PATH", STORAGE_DIR / "profit_app.sqlite3")
 
+
+def resolve_artifact_dir(artifact_path: str | Path) -> Path:
+    candidate = Path(str(artifact_path))
+    if candidate.exists():
+        return candidate
+
+    run_id = Path(str(artifact_path).replace("\\", "/")).name
+    if not run_id:
+        return candidate
+
+    return STORAGE_DIR / "models" / run_id
+
 INITIAL_ASSETS = {
     "PETR4.SA": "Petrobras PN",
     "VALE3.SA": "Vale ON",

@@ -1,7 +1,7 @@
 const configuredApiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
 const CLIENT_API_PROXY_BASE = "/api/backend";
 
-export const API_BASE_URL = configuredApiBaseUrl || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000" : "");
+export const API_BASE_URL = configuredApiBaseUrl || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8021" : "");
 
 export type Asset = {
   ticker: string;
@@ -119,6 +119,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+function withQuery(path: string, params: Record<string, string | number | boolean | undefined>) {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined) continue;
+    search.set(key, String(value));
+  }
+  const query = search.toString();
+  return query ? `${path}?${query}` : path;
+}
+
 export const api = {
   assets: () => request<{ assets: Asset[] }>("/assets"),
   prices: (ticker: string, limit = 1300) => request<{ ticker: string; rows: PriceRow[] }>(`/prices/${ticker}?limit=${limit}`),
@@ -144,7 +154,16 @@ export const api = {
   markToMarket: () => request<Record<string, unknown>>('/portfolio/mark-to-market', { method: 'POST' }),
   alphaMetrics: () => request<Record<string, any>>("/alpha/metrics"),
   paperGate: () => request<Record<string, any>>("/validation/paper-gate"),
-  refreshStatus: () => request<Record<string, unknown>>("/refresh/status")
+  refreshStatus: () => request<Record<string, unknown>>("/refresh/status"),
+  refreshRun: (options?: { maxStalenessDays?: number; refitWindowDays?: number; skipPriceUpdate?: boolean; asyncMode?: boolean }) => request<Record<string, unknown>>(
+    withQuery("/refresh/run", {
+      max_staleness_days: options?.maxStalenessDays,
+      refit_window_days: options?.refitWindowDays,
+      skip_price_update: options?.skipPriceUpdate,
+      async_mode: options?.asyncMode
+    }),
+    { method: "POST" }
+  )
 };
 
 export function assetLogoUrl(asset?: Pick<Asset, "ticker" | "logo_url"> | null) {

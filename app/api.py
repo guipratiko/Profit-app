@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import threading
 from datetime import datetime
 from uuid import uuid4
 
@@ -61,6 +63,70 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+_refresh_job_lock = threading.Lock()
+_refresh_job_state: dict[str, object | None] = {
+    "job_id": None,
+    "status": "idle",
+    "started_at": None,
+    "completed_at": None,
+    "error": None,
+    "result": None,
+}
+
+
+def _refresh_job_snapshot() -> dict:
+    with _refresh_job_lock:
+        return dict(_refresh_job_state)
+
+
+def _update_refresh_job(**values: object | None) -> None:
+    with _refresh_job_lock:
+        _refresh_job_state.update(values)
+
+
+def _run_refresh_job(job_id: str, max_staleness_days: int, refit_window_days: int, skip_price_update: bool) -> None:
+    _update_refresh_job(
+        job_id=job_id,
+        status="running",
+        started_at=datetime.utcnow().isoformat(timespec="seconds"),
+        completed_at=None,
+        error=None,
+        result=None,
+    )
+    try:
+        result = run_refresh_pipeline(
+            max_staleness_days=max_staleness_days,
+            refit_window_days=refit_window_days,
+            skip_price_update=skip_price_update,
+        )
+        _update_refresh_job(
+            status="completed",
+            completed_at=datetime.utcnow().isoformat(timespec="seconds"),
+            result=result,
+        )
+    except Exception as exc:  # pragma: no cover - defensive runtime path
+        _update_refresh_job(
+            status="failed",
+            completed_at=datetime.utcnow().isoformat(timespec="seconds"),
+            error=str(exc),
+        )
+
+
+def _start_refresh_job(max_staleness_days: int, refit_window_days: int, skip_price_update: bool) -> dict:
+    current = _refresh_job_snapshot()
+    if current.get("status") == "running":
+        return current
+
+    job_id = uuid4().hex
+    worker = threading.Thread(
+        target=_run_refresh_job,
+        args=(job_id, max_staleness_days, refit_window_days, skip_price_update),
+        daemon=True,
+    )
+    worker.start()
+    return _refresh_job_snapshot()
 
 
 def dataframe_records(frame: pd.DataFrame) -> list[dict]:
@@ -519,7 +585,29 @@ def data_status() -> dict:
 
 @app.get("/refresh/status")
 def refresh_status() -> dict:
-    return detect_staleness()
+    refresh_job = _refresh_job_snapshot()
+    try:
+        staleness = detect_staleness()
+    except sqlite3.OperationalError as exc:
+        if refresh_job.get("status") == "running":
+            last_result = refresh_job.get("result") if isinstance(refresh_job.get("result"), dict) else {}
+            previous_staleness = last_result.get("staleness") if isinstance(last_result, dict) else {}
+            return {
+                "is_stale": True,
+                "reason": "refresh_in_progress",
+                "latest_date": previous_staleness.get("latest_date") if isinstance(previous_staleness, dict) else None,
+                "today": datetime.utcnow().strftime("%Y-%m-%d"),
+                "market_reference_date": None,
+                "calendar_days_behind": None,
+                "trading_days_behind": None,
+                "refresh_job": refresh_job,
+                "warning": str(exc),
+            }
+        raise
+    return {
+        **staleness,
+        "refresh_job": refresh_job,
+    }
 
 
 @app.post("/refresh/run")
@@ -527,7 +615,17 @@ def refresh_run(
     max_staleness_days: int = Query(default=1, ge=0, le=90),
     refit_window_days: int = Query(default=180, ge=30, le=720),
     skip_price_update: bool = Query(default=False),
+    async_mode: bool = Query(default=False),
 ) -> dict:
+    if async_mode:
+        return {
+            "status": "accepted",
+            "refresh_job": _start_refresh_job(
+                max_staleness_days=max_staleness_days,
+                refit_window_days=refit_window_days,
+                skip_price_update=skip_price_update,
+            ),
+        }
     return run_refresh_pipeline(
         max_staleness_days=max_staleness_days,
         refit_window_days=refit_window_days,

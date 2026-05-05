@@ -10,6 +10,7 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.preprocessing import StandardScaler
 
+from app.config import resolve_artifact_dir
 from app.data.database import (
     get_model_runs,
     initialize_database,
@@ -81,7 +82,7 @@ def get_model_artifact_dir(run_id: str) -> Path:
     selected = model_runs[model_runs["run_id"] == run_id]
     if selected.empty:
         raise ValueError(f"Model run not found: {run_id}")
-    return Path(str(selected.iloc[0]["artifact_path"]))
+    return resolve_artifact_dir(str(selected.iloc[0]["artifact_path"]))
 
 
 def load_inference_artifacts(run_id: str) -> tuple[tf.keras.Model, StandardScaler, dict]:

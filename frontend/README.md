@@ -13,7 +13,7 @@ npm run dev -- --port 3000
 The app expects the backend API at `NEXT_PUBLIC_API_BASE_URL`.
 
 ```powershell
-$env:NEXT_PUBLIC_API_BASE_URL="http://127.0.0.1:8000"
+$env:NEXT_PUBLIC_API_BASE_URL="http://127.0.0.1:8021"
 npm run dev -- --port 3000
 ```
 

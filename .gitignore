@@ -13,6 +13,8 @@ frontend/.vercel/
 storage/*.db
 storage/*.sqlite
 storage/*.sqlite3
+storage/*.sqlite3-shm
+storage/*.sqlite3-wal
 storage/raw/
 storage/processed/
 storage/models/
