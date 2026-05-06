@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import threading
 from datetime import datetime
 from uuid import uuid4
@@ -17,7 +16,6 @@ from app.config import INITIAL_ASSETS
 from app.data.company_branding import LOGO_CACHE_TTL, asset_branding_record, get_company_logo
 from app.data.database import (
     get_fusion_predictions,
-    get_latest_model_run_id,
     get_news_events,
     get_paper_trading_signals,
     get_paper_positions,
@@ -27,14 +25,17 @@ from app.data.database import (
     get_risk_alerts,
     initialize_database,
     read_model_predictions,
+    read_operational_predictions,
     read_ohlcv_prices,
     save_real_positions,
     delete_real_position,
     update_real_position,
     update_real_position_prices,
 )
+from app.data.market_data import update_all_prices, update_latest_quote_snapshots
 from app.models.fusion import run_fusion_predictions
 from app.models.pytorch_sentiment import generate_qualitative_features
+from app.models.registry import get_best_current_schema_model_run_id
 from app.pipelines.alpha_metrics import build_alpha_metrics
 from app.pipelines.paper_validation import build_paper_validation_report
 from app.pipelines.refresh import detect_staleness, run_refresh_pipeline
@@ -48,7 +49,7 @@ from app.trading.risk_advisor import (
 app = FastAPI(
     title="Profit App Alpha API",
     version="0.9.0",
-    description="Experimental B3 alpha API for paper trading only. Not financial advice.",
+    description="B3 alpha API for trading operations.",
 )
 
 cors_origins = [
@@ -86,7 +87,13 @@ def _update_refresh_job(**values: object | None) -> None:
         _refresh_job_state.update(values)
 
 
-def _run_refresh_job(job_id: str, max_staleness_days: int, refit_window_days: int, skip_price_update: bool) -> None:
+def _run_refresh_job(
+    job_id: str,
+    max_staleness_days: int,
+    refit_window_days: int,
+    skip_price_update: bool,
+    force_refresh: bool,
+) -> None:
     _update_refresh_job(
         job_id=job_id,
         status="running",
@@ -100,6 +107,7 @@ def _run_refresh_job(job_id: str, max_staleness_days: int, refit_window_days: in
             max_staleness_days=max_staleness_days,
             refit_window_days=refit_window_days,
             skip_price_update=skip_price_update,
+            force_refresh=force_refresh,
         )
         _update_refresh_job(
             status="completed",
@@ -114,7 +122,12 @@ def _run_refresh_job(job_id: str, max_staleness_days: int, refit_window_days: in
         )
 
 
-def _start_refresh_job(max_staleness_days: int, refit_window_days: int, skip_price_update: bool) -> dict:
+def _start_refresh_job(
+    max_staleness_days: int,
+    refit_window_days: int,
+    skip_price_update: bool,
+    force_refresh: bool,
+) -> dict:
     current = _refresh_job_snapshot()
     if current.get("status") == "running":
         return current
@@ -122,7 +135,7 @@ def _start_refresh_job(max_staleness_days: int, refit_window_days: int, skip_pri
     job_id = uuid4().hex
     worker = threading.Thread(
         target=_run_refresh_job,
-        args=(job_id, max_staleness_days, refit_window_days, skip_price_update),
+        args=(job_id, max_staleness_days, refit_window_days, skip_price_update, force_refresh),
         daemon=True,
     )
     worker.start()
@@ -165,7 +178,6 @@ def build_prediction_payload(
         "technical_prediction": technical_latest,
         "fusion_prediction": fusion_latest,
         "paper_signal": paper_latest,
-        "risk_notice": "Experimental paper-trading thesis only. Not financial advice.",
     }
 
 
@@ -178,7 +190,68 @@ class RealPositionCreateRequest(BaseModel):
 
 
 def _real_portfolio_notice() -> str:
-    return "Real positions are user-managed. This is not financial advice and no orders are executed."
+    return "Real positions are user-managed."
+
+
+def _capture_entry_snapshot(ticker: str) -> dict:
+    """Snapshot the latest fusion + paper signal for a ticker at registration time.
+
+    Stored as immutable JSON on `real_positions` so the cockpit can later show
+    prob_win-na-entrada vs prob_win-hoje divergence without recomputing.
+    """
+    snapshot: dict = {"captured_at": datetime.utcnow().isoformat(timespec="seconds"), "ticker": ticker}
+    try:
+        fusion = get_fusion_predictions()
+        if not fusion.empty:
+            row = fusion[fusion["ticker"] == ticker].sort_values("created_at").tail(1)
+            if not row.empty:
+                rec = row.iloc[0].to_dict()
+                snapshot["run_id"] = rec.get("run_id")
+                snapshot["fused_score"] = float(rec.get("fused_score")) if pd.notna(rec.get("fused_score")) else None
+                snapshot["fused_direction"] = rec.get("fused_direction")
+                snapshot["probability_up"] = (
+                    float(rec.get("technical_probability_up"))
+                    if pd.notna(rec.get("technical_probability_up"))
+                    else None
+                )
+                explanation = rec.get("explanation_json")
+                if isinstance(explanation, str):
+                    try:
+                        explanation_obj = json.loads(explanation)
+                    except Exception:
+                        explanation_obj = None
+                    if isinstance(explanation_obj, dict):
+                        snapshot["regime"] = (explanation_obj.get("regime") or {}).get("regime")
+                        conformal = explanation_obj.get("technical", {}).get("conformal")
+                        if isinstance(conformal, dict):
+                            snapshot["conformal_low"] = conformal.get("interval_low")
+                            snapshot["conformal_high"] = conformal.get("interval_high")
+    except Exception as exc:  # snapshot is best-effort
+        snapshot["fusion_error"] = str(exc)
+
+    try:
+        signals = get_paper_trading_signals()
+        if not signals.empty:
+            row = signals[signals["ticker"] == ticker].sort_values("created_at").tail(1)
+            if not row.empty:
+                rec = row.iloc[0].to_dict()
+                snapshot.setdefault("run_id", rec.get("run_id"))
+                snapshot["decision"] = rec.get("decision")
+                snapshot["operational_action"] = rec.get("operational_action")
+                snapshot["paper_probability_up"] = (
+                    float(rec.get("probability_up")) if pd.notna(rec.get("probability_up")) else None
+                )
+                snapshot["paper_probability_win"] = (
+                    float(rec.get("probability_win")) if pd.notna(rec.get("probability_win")) else None
+                )
+                snapshot["paper_net_expected_return"] = (
+                    float(rec.get("net_expected_return")) if pd.notna(rec.get("net_expected_return")) else None
+                )
+                snapshot["paper_signal_id"] = rec.get("signal_id")
+    except Exception as exc:
+        snapshot["paper_error"] = str(exc)
+
+    return snapshot
 
 
 def _coerce_limit(limit: int | object, default: int) -> int:
@@ -219,14 +292,14 @@ DASHBOARD_HTML = """
 </head>
 <body>
     <header>
-        <div><h1>Profit App Alpha</h1><div class="muted">Paper trading experimental. Sem ordens reais.</div></div>
+        <div><h1>Profit App Alpha</h1><div class="muted">Cockpit operacional de sinais, risco e carteira.</div></div>
         <button onclick="auditRisk()">Auditar Risco</button>
     </header>
     <main>
         <aside>
             <label for="assetSelect">Ativo</label><br>
             <select id="assetSelect"></select>
-            <p class="muted">As previsoes sao teses experimentais e nao recomendacao financeira.</p>
+            <p class="muted">As previsoes exibem tese, risco, contexto e decisao operacional.</p>
             <div id="assetList"></div>
         </aside>
         <section>
@@ -295,8 +368,7 @@ def startup() -> None:
 def health() -> dict:
     return {
         "status": "ok",
-        "mode": "paper_trading_only",
-        "risk_notice": "Experimental system. Not financial advice and not a real order router.",
+        "mode": "production",
     }
 
 
@@ -331,7 +403,20 @@ def asset_logo(ticker: str) -> Response:
 
 
 @app.get("/prices/{ticker}")
-def price_history(ticker: str, limit: int = Query(default=120, ge=1, le=2000)) -> dict:
+def price_history(
+    ticker: str,
+    limit: int = Query(default=120, ge=1, le=2000),
+    refresh: bool = Query(default=False),
+    refresh_period: str = Query(default="7d"),
+) -> dict:
+    if ticker not in INITIAL_ASSETS:
+        raise HTTPException(status_code=400, detail=f"Ticker {ticker} is not monitored by the current market data universe")
+    if refresh:
+        update_all_prices(
+            tickers=[ticker],
+            period=refresh_period,
+            include_context_indices=False,
+        )
     prices = read_ohlcv_prices()
     filtered = prices[prices["ticker"] == ticker].sort_values("date").tail(limit)
     if filtered.empty:
@@ -353,21 +438,57 @@ def favicon() -> Response:
 
 @app.get("/predictions/{ticker}")
 def prediction_for_ticker(ticker: str) -> dict:
-    run_id = get_latest_model_run_id()
-    technical = read_model_predictions(run_id, split="test")
-    return build_prediction_payload(
-        ticker=ticker,
-        run_id=run_id,
-        technical_frame=technical,
-        fusion_frame=get_fusion_predictions(),
-        paper_frame=get_paper_trading_signals(),
-    )
+    try:
+        run_id = get_best_current_schema_model_run_id()
+    except ValueError:
+        # Cold-start case: no model trained yet. Return a 200 with a stub
+        # payload so the frontend can render its empty state instead of
+        # surfacing a 500.
+        return {
+            "ticker": ticker,
+            "model_run_id": None,
+            "technical_prediction": None,
+            "fusion_prediction": None,
+            "paper_signal": None,
+            "status": "no_trained_model_registered",
+        }
+    technical = read_operational_predictions(run_id)
+    if technical.empty:
+        technical = read_model_predictions(run_id, split="test")
+    try:
+        return build_prediction_payload(
+            ticker=ticker,
+            run_id=run_id,
+            technical_frame=technical,
+            fusion_frame=get_fusion_predictions(),
+            paper_frame=get_paper_trading_signals(),
+        )
+    except HTTPException:
+        return {
+            "ticker": ticker,
+            "model_run_id": run_id,
+            "technical_prediction": None,
+            "fusion_prediction": None,
+            "paper_signal": None,
+            "status": "prediction_pending_for_asset",
+        }
 
 
 @app.get("/predictions")
 def prediction_snapshot() -> dict:
-    run_id = get_latest_model_run_id()
-    technical = read_model_predictions(run_id, split="test")
+    try:
+        run_id = get_best_current_schema_model_run_id()
+    except ValueError:
+        # Cold-start: no model registered. Return one empty payload per ticker
+        # so the frontend can list assets with "—" placeholders rather than
+        # showing a global error banner.
+        return {
+            "predictions": [{"ticker": ticker} for ticker in INITIAL_ASSETS],
+            "warning": "no_trained_model_registered",
+        }
+    technical = read_operational_predictions(run_id)
+    if technical.empty:
+        technical = read_model_predictions(run_id, split="test")
     fusion = get_fusion_predictions()
     paper = get_paper_trading_signals()
 
@@ -384,7 +505,16 @@ def prediction_snapshot() -> dict:
                 )
             )
         except HTTPException:
-            predictions.append({"ticker": ticker})
+            predictions.append(
+                {
+                    "ticker": ticker,
+                    "model_run_id": run_id,
+                    "technical_prediction": None,
+                    "fusion_prediction": None,
+                    "paper_signal": None,
+                    "status": "prediction_pending_for_asset",
+                }
+            )
 
     return {"predictions": predictions}
 
@@ -407,7 +537,6 @@ def update_and_recalculate(
     result: dict = {
         "updated_prices": False,
         "retrained_tensorflow": False,
-        "risk_notice": "Endpoint recalculates local alpha artifacts only; it does not execute orders.",
     }
     if analyze_sentiment:
         result["sentiment"] = generate_qualitative_features()
@@ -476,6 +605,7 @@ def register_real_position(payload: RealPositionCreateRequest) -> dict:
     position_id = f"real_{uuid4().hex[:16]}"
     entry_at = (payload.entry_at or datetime.utcnow()).isoformat(timespec="seconds")
     notes = payload.notes.strip() if payload.notes else None
+    snapshot = _capture_entry_snapshot(ticker)
     save_real_positions(
         pd.DataFrame(
             [
@@ -489,6 +619,14 @@ def register_real_position(payload: RealPositionCreateRequest) -> dict:
                     "current_price": float(payload.entry_price),
                     "last_updated_at": datetime.utcnow().isoformat(timespec="seconds"),
                     "notes": notes,
+                    "entry_run_id": snapshot.get("run_id"),
+                    "entry_probability_up": snapshot.get("probability_up"),
+                    "entry_fused_score": snapshot.get("fused_score"),
+                    "entry_regime": snapshot.get("regime"),
+                    "entry_intent_decision": snapshot.get("decision"),
+                    "entry_conformal_low": snapshot.get("conformal_low"),
+                    "entry_conformal_high": snapshot.get("conformal_high"),
+                    "entry_snapshot_json": json.dumps(snapshot, default=str) if snapshot else None,
                 }
             ]
         )
@@ -497,7 +635,7 @@ def register_real_position(payload: RealPositionCreateRequest) -> dict:
         "position_id": position_id,
         "status": "created",
         "ticker": ticker,
-        "risk_notice": _real_portfolio_notice(),
+        "entry_snapshot": snapshot,
     }
 
 
@@ -507,7 +645,6 @@ def real_portfolio_positions(limit: int = Query(default=200, ge=1, le=1000)) -> 
     positions = get_real_positions().head(_coerce_limit(limit, 200))
     return {
         "positions": dataframe_records(positions),
-        "risk_notice": _real_portfolio_notice(),
     }
 
 
@@ -535,18 +672,35 @@ def edit_real_position(position_id: str, payload: RealPositionCreateRequest) -> 
         "position_id": position_id,
         "status": "updated",
         "ticker": ticker,
-        "risk_notice": _real_portfolio_notice(),
     }
 
 
 @app.post("/portfolio/mark-to-market")
-def mark_to_market_portfolio() -> dict:
+def mark_to_market_portfolio(
+    refresh_prices: bool = Query(default=True),
+    refresh_period: str = Query(default="7d"),
+) -> dict:
     initialize_database()
+    positions = get_real_positions(mark_to_market=False)
+    tickers = sorted(set(positions["ticker"].astype(str))) if not positions.empty else []
+    updated_prices: dict[str, int] = {}
+    updated_live_quotes: dict[str, int] = {}
+    if refresh_prices and tickers:
+        updated_prices = update_all_prices(
+            tickers=tickers,
+            period=refresh_period,
+            include_context_indices=False,
+        )
+        updated_live_quotes = update_latest_quote_snapshots(tickers=tickers)
     updated_count = update_real_position_prices()
     return {
         "updated_count": int(updated_count),
+        "refreshed_prices": bool(refresh_prices and tickers),
+        "price_refresh_period": refresh_period,
+        "price_tickers": tickers,
+        "updated_price_rows": updated_prices,
+        "updated_live_quote_rows": updated_live_quotes,
         "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
-        "risk_notice": _real_portfolio_notice(),
     }
 
 
@@ -559,7 +713,6 @@ def remove_real_position(position_id: str) -> dict:
     return {
         "position_id": position_id,
         "status": "deleted",
-        "risk_notice": _real_portfolio_notice(),
     }
 
 
@@ -588,7 +741,7 @@ def refresh_status() -> dict:
     refresh_job = _refresh_job_snapshot()
     try:
         staleness = detect_staleness()
-    except sqlite3.OperationalError as exc:
+    except Exception as exc:  # DB connectivity hiccups during a running refresh
         if refresh_job.get("status") == "running":
             last_result = refresh_job.get("result") if isinstance(refresh_job.get("result"), dict) else {}
             previous_staleness = last_result.get("staleness") if isinstance(last_result, dict) else {}
@@ -616,6 +769,7 @@ def refresh_run(
     refit_window_days: int = Query(default=180, ge=30, le=720),
     skip_price_update: bool = Query(default=False),
     async_mode: bool = Query(default=False),
+    force_refresh: bool = Query(default=False),
 ) -> dict:
     if async_mode:
         return {
@@ -624,12 +778,14 @@ def refresh_run(
                 max_staleness_days=max_staleness_days,
                 refit_window_days=refit_window_days,
                 skip_price_update=skip_price_update,
+                force_refresh=force_refresh,
             ),
         }
     return run_refresh_pipeline(
         max_staleness_days=max_staleness_days,
         refit_window_days=refit_window_days,
         skip_price_update=skip_price_update,
+        force_refresh=force_refresh,
     )
 
 

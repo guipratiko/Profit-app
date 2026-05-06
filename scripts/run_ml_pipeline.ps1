@@ -30,8 +30,9 @@ function Invoke-Step {
 Invoke-Step "Generate technical features" @("-m", "app.cli", "generate-features")
 
 if (-not $SkipTraining) {
-    Invoke-Step "Train TensorFlow direction model" @("-m", "app.cli", "train-tf-direction", "--epochs", "40", "--batch-size", "64")
+    Invoke-Step "Train TensorFlow binary entry model" @("-m", "app.cli", "train-tf-binary")
     Invoke-Step "Train trade-outcome model" @("-m", "app.cli", "train-trade-outcome", "--holding-days", "7", "--min-reward-risk", "1.5", "--cost-per-trade", "0.002", "--spread", "0.001", "--slippage", "0.001", "--max-iter", "160", "--learning-rate", "0.05")
+    Invoke-Step "Walk-forward backtest (auditable model selection)" @("-m", "app.cli", "run-walk-forward")
 }
 
 $tfInferenceArgs = @("-m", "app.cli", "run-current-inference")

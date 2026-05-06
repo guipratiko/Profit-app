@@ -18,8 +18,13 @@ from app.data.database import (
     get_operational_trade_outcomes,
     get_paper_trading_signals,
     get_trade_outcome_runs,
+    read_latest_operational_trade_outcomes,
 )
-from app.features.trade_outcomes import OUTCOME_LABELS, build_trade_outcome_dataset
+from app.features.trade_outcomes import (
+    OUTCOME_LABELS,
+    build_current_trade_outcome_features,
+    build_trade_outcome_dataset,
+)
 from app.models.trade_outcome import (
     run_trade_outcome_inference,
     train_trade_outcome_model,
@@ -65,6 +70,27 @@ def main() -> None:
     operational = get_operational_trade_outcomes()
     if operational.empty:
         raise AssertionError("operational_trade_outcomes table is empty")
+    latest_operational = read_latest_operational_trade_outcomes()
+    if latest_operational.empty:
+        raise AssertionError("Latest operational trade outcomes lookup returned no rows")
+    latest_run_ids = set(latest_operational["run_id"].astype(str).unique())
+    if latest_run_ids != {str(inference["run_id"])}:
+        raise AssertionError(
+            f"Expected latest operational trade outcomes to use only run {inference['run_id']}, got {latest_run_ids}"
+        )
+
+    current_features = build_current_trade_outcome_features()
+    merged = latest_operational.merge(
+        current_features[["ticker", "date", "atr_pct_14"]],
+        on=["ticker", "date"],
+        how="inner",
+    )
+    if merged.empty:
+        raise AssertionError("Could not align latest operational trade outcomes with current features")
+    expected_stop_distance = (merged["atr_pct_14"].astype(float) * 2.0).clip(lower=1e-6, upper=0.5)
+    max_stop_delta = (merged["stop_distance"].astype(float) - expected_stop_distance).abs().max()
+    if float(max_stop_delta) > 1e-6:
+        raise AssertionError(f"Trade outcome stop distances are not ATR-aligned; max delta was {max_stop_delta}")
 
     paper_result = generate_paper_trading_signals(run_id=direction_run_id)
     if paper_result["signal_source"] != "operational_trade_outcomes":

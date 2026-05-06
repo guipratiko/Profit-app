@@ -300,7 +300,10 @@ def run_trade_outcome_inference(
 
     records: list[dict] = []
     for offset, (_, feature_row) in enumerate(current.iterrows()):
-        stop_distance = calculate_stop_distance(feature_row["volatility_21d"])
+        stop_distance = calculate_stop_distance(
+            feature_row["volatility_21d"],
+            feature_row.get("atr_pct_14"),
+        )
         records.append(
             {
                 "run_id": selected_run_id,

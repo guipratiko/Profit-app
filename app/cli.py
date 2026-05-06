@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Profit App alpha CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("init-db", help="Create the SQLite database schema")
+    subparsers.add_parser("init-db", help="Create the database schema")
 
     update_parser = subparsers.add_parser("update-prices", help="Download OHLCV prices")
     update_parser.add_argument("--period", default=DEFAULT_PRICE_PERIOD)
@@ -44,9 +44,35 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("generate-features", help="Build technical features and future targets")
     subparsers.add_parser("feature-summary", help="Show stored technical feature row counts")
 
-    train_parser = subparsers.add_parser("train-tf-direction", help="Train TensorFlow 7-day direction model")
+    train_parser = subparsers.add_parser("train-tf-direction", help="Train TensorFlow 7-day direction model (legacy 3-class)")
     train_parser.add_argument("--epochs", type=int, default=40)
     train_parser.add_argument("--batch-size", type=int, default=64)
+
+    train_binary_parser = subparsers.add_parser(
+        "train-tf-binary",
+        help="Train TensorFlow 7-day BINARY enter-long model (replaces 3-class for entry signals)",
+    )
+    train_binary_parser.add_argument("--epochs", type=int, default=60)
+    train_binary_parser.add_argument("--batch-size", type=int, default=128)
+    train_binary_parser.add_argument("--seed", type=int, default=42)
+    train_binary_parser.add_argument("--l2", type=float, default=0.0, help="L2 weight decay (0 disables)")
+    train_binary_parser.add_argument(
+        "--dropout-scale",
+        type=float,
+        default=1.0,
+        help="Multiplier on dropout layers (1.0 keeps defaults; 1.3 = +30%% regularization)",
+    )
+
+    train_sklearn_binary_parser = subparsers.add_parser(
+        "train-sklearn-binary",
+        help="Train sklearn gradient-boosting 7-day BINARY enter-long model",
+    )
+    train_sklearn_binary_parser.add_argument("--max-iter", type=int, default=300)
+    train_sklearn_binary_parser.add_argument("--learning-rate", type=float, default=0.04)
+    train_sklearn_binary_parser.add_argument("--l2", type=float, default=0.02)
+    train_sklearn_binary_parser.add_argument("--max-leaf-nodes", type=int, default=15)
+    train_sklearn_binary_parser.add_argument("--min-samples-leaf", type=int, default=40)
+    train_sklearn_binary_parser.add_argument("--seed", type=int, default=42)
 
     subparsers.add_parser("model-summary", help="Show trained model runs")
 
@@ -249,6 +275,76 @@ def main() -> None:
         print(f"epochs_ran: {metadata['epochs_ran']}")
         print(f"validation_accuracy: {metadata['validation_accuracy']:.4f}")
         print(f"test_accuracy: {metadata['test_accuracy']:.4f}")
+        return
+
+    if args.command == "train-tf-binary":
+        from app.models.tensorflow_binary import train_tensorflow_binary_model
+
+        metadata = train_tensorflow_binary_model(
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            seed=args.seed,
+            l2_strength=args.l2,
+            dropout_scale=args.dropout_scale,
+        )
+        val = metadata["validation_metrics_calibrated"]
+        test = metadata["test_metrics_calibrated"]
+        print("TensorFlow BINARY enter-long model trained")
+        print(f"run_id: {metadata['run_id']}")
+        print(f"epochs_ran: {metadata['epochs_ran']}")
+        print(f"train_positive_rate: {metadata['train_positive_rate']:.4f}")
+        print("-- validation (calibrated) --")
+        print(f"  accuracy:        {val['accuracy']:.4f}")
+        print(f"  auc:             {val['auc']:.4f}" if val['auc'] is not None else "  auc: n/a")
+        print(f"  base_rate(pos):  {val['base_rate_positive']:.4f}")
+        print(f"  high_conf_count: {val['high_confidence_count']}")
+        if val['precision_at_p60'] is not None:
+            print(f"  precision@p60:   {val['precision_at_p60']:.4f}")
+        else:
+            print("  precision@p60:   n/a (no high-confidence rows)")
+        print("-- test (calibrated) --")
+        print(f"  accuracy:        {test['accuracy']:.4f}")
+        print(f"  auc:             {test['auc']:.4f}" if test['auc'] is not None else "  auc: n/a")
+        print(f"  high_conf_count: {test['high_confidence_count']}")
+        if test['precision_at_p60'] is not None:
+            print(f"  precision@p60:   {test['precision_at_p60']:.4f}")
+        return
+
+    if args.command == "train-sklearn-binary":
+        from app.models.sklearn_binary import train_sklearn_binary_model
+
+        metadata = train_sklearn_binary_model(
+            max_iter=args.max_iter,
+            learning_rate=args.learning_rate,
+            l2_regularization=args.l2,
+            max_leaf_nodes=args.max_leaf_nodes,
+            min_samples_leaf=args.min_samples_leaf,
+            seed=args.seed,
+        )
+        val = metadata["validation_metrics_calibrated"]
+        test = metadata["test_metrics_calibrated"]
+        raw_val = metadata["validation_metrics_raw"]
+        raw_test = metadata["test_metrics_raw"]
+        print("Sklearn BINARY enter-long model trained")
+        print(f"run_id: {metadata['run_id']}")
+        print(f"n_iter: {metadata['n_iter']}")
+        print(f"train_positive_rate: {metadata['train_positive_rate']:.4f}")
+        print("-- validation --")
+        print(f"  accuracy(cal):   {val['accuracy']:.4f}")
+        print(f"  auc(cal/raw):    {val['auc']:.4f} / {raw_val['auc']:.4f}")
+        print(f"  p60_count(cal):  {val['high_confidence_count']}")
+        if val['precision_at_p60'] is not None:
+            print(f"  precision@p60:   {val['precision_at_p60']:.4f}")
+        else:
+            print("  precision@p60:   n/a (no high-confidence rows)")
+        print("-- test --")
+        print(f"  accuracy(cal):   {test['accuracy']:.4f}")
+        print(f"  auc(cal/raw):    {test['auc']:.4f} / {raw_test['auc']:.4f}")
+        print(f"  p60_count(cal):  {test['high_confidence_count']}")
+        if test['precision_at_p60'] is not None:
+            print(f"  precision@p60:   {test['precision_at_p60']:.4f}")
+        else:
+            print("  precision@p60:   n/a (no high-confidence rows)")
         return
 
     if args.command == "model-summary":

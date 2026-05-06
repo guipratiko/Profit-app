@@ -27,34 +27,157 @@ from __future__ import annotations
 import hashlib
 import json
 
+import numpy as np
 import pandas as pd
 
 from app.data.database import (
     get_fusion_predictions,
     get_latest_model_run_id,
+    get_model_runs,
     get_qualitative_features,
     initialize_database,
     read_model_predictions,
     read_ohlcv_prices,
+    read_operational_predictions,
     save_fusion_predictions,
 )
 from app.trading.regime import (
     SENTIMENT_OVERRIDE_THRESHOLD,
+    apply_hmm_overlay,
     assess_regime,
     estimate_volatility_percentile,
+    fit_market_hmm,
 )
 
 
-FUSION_VERSION = "v2_regime_adaptive_policy"
+FUSION_VERSION = "v3_regime_hmm_conformal_bma"
 HORIZON = "7d"
 
 # Default fallback weights when called with the legacy signature (no regime info).
 LEGACY_FALLBACK_WEIGHTS = (0.85, 0.15)  # technical, qualitative
 
 
+def _extract_conformal(row: pd.Series) -> dict | None:
+    """Pull split-conformal interval from an operational prediction row.
+
+    Returns None when the source run has no conformal payload (older models).
+    """
+    if "conformal_quantile" not in row.index:
+        return None
+    quantile = row.get("conformal_quantile")
+    low = row.get("conformal_interval_low")
+    high = row.get("conformal_interval_high")
+    if pd.isna(quantile) and pd.isna(low) and pd.isna(high):
+        return None
+    return {
+        "quantile": None if pd.isna(quantile) else float(quantile),
+        "alpha": None if pd.isna(row.get("conformal_alpha")) else float(row.get("conformal_alpha")),
+        "interval_low": None if pd.isna(low) else float(low),
+        "interval_high": None if pd.isna(high) else float(high),
+    }
+
+
 def build_fusion_id(run_id: str, ticker: str, signal_date: str, horizon: str) -> str:
     payload = f"{FUSION_VERSION}|{run_id}|{ticker}|{signal_date}|{horizon}"
     return "fusion_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Bayesian Model Averaging across compatible binary runs (P4)
+# ---------------------------------------------------------------------------
+# We treat each binary run targeting ``target_enter_long_7d`` as a candidate
+# model and weight its current-day probability_up by softmax(beta * accuracy).
+# ``accuracy`` is the validation_accuracy stored in model_runs at training
+# time. Older runs without validation_accuracy are ignored. The blended
+# probability replaces the lead run's technical_probability_up; both the
+# blended and the original (lead-only) values are persisted in the
+# explanation_json so dashboards can audit the contribution.
+BMA_TEMPERATURE = 8.0  # exp(8 * (acc_i - acc_max)) — sharper than vanilla softmax
+BMA_TARGET_NAMES = {"target_enter_long_7d"}
+BMA_MIN_RUNS = 2
+
+
+def _collect_bma_predictions(
+    primary_run_id: str,
+    target_name: str,
+) -> tuple[dict[str, list[tuple[str, float, float]]], dict[str, float]]:
+    """Return (per-ticker contributions, run_weights).
+
+    Contributions: ``ticker -> list of (run_id, probability_up, weight)``.
+    run_weights: ``run_id -> normalised weight``.
+    """
+    runs = get_model_runs()
+    if runs.empty:
+        return {}, {}
+    compatible = runs[
+        (runs["target_name"] == target_name)
+        & runs["validation_accuracy"].notna()
+    ].copy()
+    if compatible.empty:
+        return {}, {}
+    accuracies = compatible["validation_accuracy"].astype(float).to_numpy()
+    max_acc = float(accuracies.max())
+    raw_weights = np.exp(BMA_TEMPERATURE * (accuracies - max_acc))
+    total = float(raw_weights.sum())
+    if total <= 0:
+        return {}, {}
+    weights = raw_weights / total
+    run_weights = {
+        str(rid): float(w) for rid, w in zip(compatible["run_id"].tolist(), weights)
+    }
+    if len(run_weights) < BMA_MIN_RUNS:
+        return {}, run_weights
+
+    contributions: dict[str, list[tuple[str, float, float]]] = {}
+    for run_id, weight in run_weights.items():
+        try:
+            preds = read_operational_predictions(run_id)
+        except Exception:
+            preds = pd.DataFrame()
+        if preds.empty:
+            continue
+        latest = (
+            preds.sort_values("date").groupby("ticker", as_index=False).tail(1)
+        )
+        for _idx, row in latest.iterrows():
+            ticker = str(row["ticker"])
+            try:
+                p_up = float(row["probability_up"])
+            except (TypeError, ValueError):
+                continue
+            contributions.setdefault(ticker, []).append((run_id, p_up, weight))
+    return contributions, run_weights
+
+
+def _bma_blend(
+    contributions: list[tuple[str, float, float]],
+    primary_run_id: str,
+    primary_p_up: float,
+) -> dict | None:
+    """Blend contributions for one ticker. Returns None if not enough info."""
+    if len(contributions) < BMA_MIN_RUNS:
+        return None
+    has_primary = any(rid == primary_run_id for rid, _, _ in contributions)
+    if not has_primary:
+        # Add the primary run's prediction with the largest weight tier so the
+        # current-active model still anchors the blend.
+        max_weight = max(w for _, _, w in contributions)
+        contributions = list(contributions) + [(primary_run_id, primary_p_up, max_weight)]
+    weight_total = sum(w for _, _, w in contributions)
+    if weight_total <= 0:
+        return None
+    blended = sum(p * w for _, p, w in contributions) / weight_total
+    detail = [
+        {"run_id": rid, "probability_up": float(p), "weight": float(w / weight_total)}
+        for rid, p, w in contributions
+    ]
+    return {
+        "blended_probability_up": float(blended),
+        "n_models": len(contributions),
+        "contributions": detail,
+        "method": "softmax_validation_accuracy_v1",
+        "temperature": BMA_TEMPERATURE,
+    }
 
 
 def confidence_from_prediction(row: pd.Series) -> float:
@@ -192,12 +315,16 @@ def build_fusion_predictions(
     qualitative_features: pd.DataFrame,
     run_id: str,
     prices: pd.DataFrame | None = None,
+    bma_contributions: dict[str, list[tuple[str, float, float]]] | None = None,
+    bma_run_weights: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     if technical_predictions.empty:
         return pd.DataFrame()
 
     if prices is None:
         prices = read_ohlcv_prices()
+
+    market_hmm_state = fit_market_hmm(prices)
 
     latest_predictions = (
         technical_predictions.sort_values("date").groupby("ticker", as_index=False).tail(1)
@@ -207,7 +334,18 @@ def build_fusion_predictions(
     for _index, row in latest_predictions.iterrows():
         ticker = str(row["ticker"])
         signal_date = str(row["date"])
-        technical_probability_up = float(row["probability_up"])
+        raw_technical_probability_up = float(row["probability_up"])
+        bma_payload = None
+        if bma_contributions:
+            bma_payload = _bma_blend(
+                bma_contributions.get(ticker, []),
+                primary_run_id=run_id,
+                primary_p_up=raw_technical_probability_up,
+            )
+        if bma_payload is not None:
+            technical_probability_up = float(bma_payload["blended_probability_up"])
+        else:
+            technical_probability_up = raw_technical_probability_up
         technical_confidence = confidence_from_prediction(row)
         context = choose_context_for_signal(qualitative_features, ticker, signal_date)
         sentiment_score = float(context["sentiment_score"])
@@ -226,6 +364,7 @@ def build_fusion_predictions(
             event_magnitude=event_magnitude,
             volatility_percentile=vol_pct,
         )
+        regime = apply_hmm_overlay(regime, market_hmm_state)
 
         fused_score = calculate_fused_score(
             technical_probability_up,
@@ -239,14 +378,13 @@ def build_fusion_predictions(
         fused_direction = direction_from_fused_score(fused_score)
 
         explanation = {
-            "language_guardrail": (
-                "Experimental fused prediction only. Not financial advice and not a real order. "
-                "Hypothesis-based regime-adaptive policy."
-            ),
             "technical": {
                 "probability_up": technical_probability_up,
+                "probability_up_lead_run": raw_technical_probability_up,
                 "confidence": technical_confidence,
                 "model_run_id": run_id,
+                "conformal": _extract_conformal(row),
+                "bma": bma_payload,
             },
             "contextual": {
                 "sentiment_score": sentiment_score,
@@ -267,6 +405,7 @@ def build_fusion_predictions(
                 "divergence": regime.divergence,
                 "notes": regime.notes,
                 "override_threshold": SENTIMENT_OVERRIDE_THRESHOLD,
+                "hmm": market_hmm_state,
             },
             "fusion": {
                 "version": FUSION_VERSION,
@@ -300,26 +439,54 @@ def build_fusion_predictions(
 def run_fusion_predictions(run_id: str | None = None) -> dict:
     initialize_database()
     selected_run_id = run_id or get_latest_model_run_id()
-    technical_predictions = read_model_predictions(selected_run_id, split="test")
+    # Prefer operational predictions (current-day) so we get conformal bands
+    # and the latest features. Fall back to the historical test split when
+    # no operational predictions exist yet (legacy / fresh databases).
+    technical_predictions = read_operational_predictions(selected_run_id)
+    if technical_predictions.empty:
+        technical_predictions = read_model_predictions(selected_run_id, split="test")
+        target_for_bma = None
+    else:
+        target_for_bma = (
+            str(technical_predictions["target_name"].iloc[0])
+            if "target_name" in technical_predictions.columns
+            else None
+        )
     qualitative_features = get_qualitative_features()
     prices = read_ohlcv_prices()
+    bma_contributions: dict[str, list[tuple[str, float, float]]] = {}
+    bma_run_weights: dict[str, float] = {}
+    if target_for_bma in BMA_TARGET_NAMES:
+        bma_contributions, bma_run_weights = _collect_bma_predictions(
+            primary_run_id=selected_run_id,
+            target_name=target_for_bma,
+        )
     predictions = build_fusion_predictions(
-        technical_predictions, qualitative_features, selected_run_id, prices=prices
+        technical_predictions,
+        qualitative_features,
+        selected_run_id,
+        prices=prices,
+        bma_contributions=bma_contributions,
+        bma_run_weights=bma_run_weights,
     )
     inserted = save_fusion_predictions(predictions)
     directions = {} if predictions.empty else predictions["fused_direction"].value_counts().to_dict()
     regimes: dict[str, int] = {}
     overrides = 0
+    bma_blended = 0
     if not predictions.empty:
         for raw in predictions["explanation_json"].tolist():
             try:
-                payload = json.loads(raw).get("regime", {})
+                payload = json.loads(raw)
             except (TypeError, ValueError):
                 continue
-            regime = payload.get("regime", "unknown")
+            regime_payload = payload.get("regime", {})
+            regime = regime_payload.get("regime", "unknown")
             regimes[regime] = regimes.get(regime, 0) + 1
-            if payload.get("override_qualitative"):
+            if regime_payload.get("override_qualitative"):
                 overrides += 1
+            if (payload.get("technical", {}) or {}).get("bma"):
+                bma_blended += 1
     return {
         "run_id": selected_run_id,
         "generated": int(len(predictions)),
@@ -327,6 +494,8 @@ def run_fusion_predictions(run_id: str | None = None) -> dict:
         "directions": directions,
         "regimes": regimes,
         "qualitative_overrides": overrides,
+        "bma_blended": bma_blended,
+        "bma_run_weights": bma_run_weights,
         "fusion_version": FUSION_VERSION,
     }
 

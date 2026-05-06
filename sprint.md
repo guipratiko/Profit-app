@@ -10,7 +10,7 @@ O material define uma aplicacao de inteligencia artificial para apoio a decisoes
 - Um motor de re-treino incremental para atualizar o sistema quando o usuario fica dias sem usar a aplicacao.
 - Um conselheiro de risco para acompanhar operacoes abertas e recomendar saidas quando o valor esperado deixa de compensar o risco.
 
-O ponto mais importante: o projeto nao deve nascer como um sistema que promete acertar o mercado. Ele deve nascer como uma plataforma experimental, auditavel e mensuravel, capaz de testar hipoteses com dados historicos, explicar suas previsoes e acompanhar resultados reais em ambiente simulado antes de qualquer uso com dinheiro verdadeiro.
+O ponto mais importante: o projeto deve nascer como uma plataforma operacional, auditavel e mensuravel, capaz de testar hipoteses com dados historicos, explicar suas previsoes e acompanhar resultados em producao com trilha completa de risco.
 
 Para este trabalho, a restricao de escopo e uma vantagem. O objetivo nao e expor uma arquitetura comercial completa, nem construir algo excessivamente complexo. O objetivo e criar um alpha funcional: pequeno, utilizavel no dia a dia pelo proprio autor, bom o suficiente para testar sinais em paper trading e claro o bastante para apresentar o papel de PyTorch e TensorFlow.
 
@@ -205,10 +205,10 @@ Saidas:
 Regras iniciais:
 
 - Nenhuma previsao pode virar operacao simulada sem stop, alvo, confianca e tamanho maximo de posicao.
-- Nenhuma previsao deve ser exibida como recomendacao forte se perder para baselines simples.
+- Nenhuma previsao deve virar acao operacional se perder para baselines simples.
 - Toda tese deve ser salva antes do resultado acontecer.
 - O sistema deve conseguir dizer "nao operar" quando a relacao risco/retorno for ruim.
-- O alpha nao deve executar ordens reais nem integrar com corretora.
+- O alpha deve registrar decisao, tese, sizing, risco e estado operacional antes de qualquer acao de carteira.
 
 ## 5. Arquitetura Tecnica Proposta
 
@@ -220,7 +220,7 @@ Regras iniciais:
 - yfinance ou fonte equivalente para OHLCV.
 - TensorFlow/Keras para o bloco quantitativo.
 - PyTorch/Hugging Face para o bloco qualitativo.
-- SQLite no MVP; PostgreSQL em fase posterior.
+- PostgreSQL como banco operacional.
 - APScheduler, Celery ou RQ para jobs de atualizacao e auditoria.
 
 ### Frontend
@@ -241,9 +241,9 @@ Regras iniciais:
 
 ### Observacao importante
 
-Como o projeto envolve investimento, o app deve exibir que as previsoes sao experimentais e nao constituem recomendacao financeira profissional. A primeira versao deve operar em modo simulado.
+Como o projeto envolve investimento, o app deve exibir previsoes com tese, risco, custos, confianca, decisao operacional e justificativa auditavel.
 
-Para preservar a ideia e manter a entrega viavel, o trabalho deve apresentar um MVP controlado. A demonstracao deve mostrar o fluxo essencial com PyTorch e TensorFlow, mas sem expor estrategias proprietarias, automatizar ordens reais ou prometer desempenho financeiro.
+Para preservar a ideia e manter a entrega viavel, o trabalho deve apresentar um MVP controlado. A demonstracao deve mostrar o fluxo essencial com PyTorch e TensorFlow, mantendo estrategias proprietarias em camada interna e priorizando rastreabilidade financeira.
 
 ## 6. Backlog de Sprints
 
@@ -574,7 +574,7 @@ Tarefas:
 - Salvar versao do modelo usado.
 - Salvar dados de entrada principais.
 - Criar historico de acertos e erros.
-- Exibir aviso de risco financeiro.
+- Exibir painel de risco financeiro.
 - Criar limites de confianca minima.
 - Bloquear recomendacoes quando dados estiverem incompletos.
 - Salvar custos simulados usados em cada operacao.
@@ -603,7 +603,7 @@ Tarefas:
 - Criar seed/demo local.
 - Documentar limitacoes.
 - Criar roteiro de demonstracao.
-- Criar aviso claro de que o sistema nao executa ordens reais.
+- Criar status claro de execucao, carteira e risco operacional.
 - Criar modo demo com dados suficientes para apresentacao.
 - Separar o que sera apresentado do que ficara como evolucao futura.
 
@@ -675,7 +675,7 @@ Mitigacoes:
 - Exibir intervalos de confianca.
 - Bloquear recomendacoes com baixa confianca.
 - Simular custos, spread e slippage.
-- Usar paper trading antes de qualquer capital real.
+- Usar validacao operacional antes de ampliar capital.
 - Calcular tamanho maximo de posicao.
 - Implementar decisao explicita de "nao operar".
 

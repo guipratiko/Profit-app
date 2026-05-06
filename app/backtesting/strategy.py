@@ -337,7 +337,7 @@ def run_probability_backtest(
     metadata = {
         "strategy": "probability_up_threshold_non_overlapping",
         "split": split,
-        "notes": "Long-only paper backtest. No real orders. Net return uses realistic B3 costs when enabled.",
+        "notes": "Long-only backtest. Net return uses realistic B3 costs when enabled.",
         "cost_model": "b3_realistic_round_trip_v1" if use_b3_costs else "fixed_round_trip_cost",
         "use_b3_costs": bool(use_b3_costs),
         "backtest_notional_brl": float(notional_brl),

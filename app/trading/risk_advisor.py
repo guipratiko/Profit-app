@@ -85,7 +85,6 @@ def build_positions_from_signals(signals: pd.DataFrame | None = None) -> pd.Data
         metadata = {
             "risk_advisor_version": RISK_ADVISOR_VERSION,
             "source": "paper_trading_signal",
-            "language_guardrail": "Simulated paper position only. Not financial advice and not a real order.",
         }
         records.append(
             {
@@ -436,9 +435,6 @@ def conselheiro_evaluate_position(
             "loss": probability_loss,
             "timeout": probability_timeout,
         },
-        "language_guardrail": (
-            "Conselheiro evaluation. Hypothesis-based exit policy; not financial advice."
-        ),
     }
     return {
         "position_id": data["position_id"],

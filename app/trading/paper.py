@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 
 from app.backtesting.strategy import run_walk_forward_backtest
@@ -14,6 +15,7 @@ from app.data.database import (
     get_paper_positions,
     get_paper_trading_signals,
     initialize_database,
+    get_trade_outcome_runs,
     read_latest_operational_trade_outcomes,
     read_ohlcv_prices,
     read_model_predictions,
@@ -41,6 +43,12 @@ OPERATIONAL_ACTION_WATCHLIST = "WATCHLIST"
 OPERATIONAL_ACTION_NO_TRADE = "NO_TRADE"
 OPERATIONAL_ACTION_LEGACY_SIMULATE = "LEGACY_SIMULATE_LONG"
 OPERATIONAL_ACTION_LEGACY_BLOCK = "LEGACY_NO_TRADE"
+
+MIN_TRADE_OUTCOME_TEST_TRADES = 20
+MIN_TRADE_OUTCOME_TEST_WIN_RATE = 0.45
+MIN_TECHNICAL_FALLBACK_TRADES = 20
+MIN_TECHNICAL_FALLBACK_PROFITABLE_TICKERS = 2
+TECHNICAL_FALLBACK_THRESHOLD_GRID = tuple(round(value, 3) for value in np.arange(0.50, 0.951, 0.05))
 
 
 @dataclass(frozen=True)
@@ -75,6 +83,37 @@ def calculate_position_size(
     max_shares = math.floor(risk_budget / per_share_risk)
     max_position_value = max_shares * entry_price
     return float(max_position_value), int(max_shares), float(risk_budget)
+
+
+def build_book_correlation_lookup(
+    prices: pd.DataFrame,
+    book_tickers: list[str],
+    *,
+    window_days: int = 126,
+) -> dict[str, float]:
+    """Compute average pairwise correlation of each candidate's daily returns vs the book.
+
+    Returns a dict mapping ticker -> avg_correlation. Used by `size_position` to
+    apply the correlation-aware penalty (DEFAULT_MAX_AVG_BOOK_CORRELATION).
+    """
+    if prices.empty or not book_tickers:
+        return {}
+    book_set = {t for t in book_tickers if isinstance(t, str)}
+    if not book_set:
+        return {}
+    df = prices[["ticker", "date", "close"]].copy()
+    df["date"] = pd.to_datetime(df["date"])
+    pivot = df.pivot_table(index="date", columns="ticker", values="close", aggfunc="last")
+    pivot = pivot.sort_index().tail(window_days + 5)
+    if pivot.shape[0] < 30:
+        return {}
+    returns = pivot.pct_change().dropna(how="all")
+    correlations = returns.corr(min_periods=20)
+    book_in_corr = [t for t in book_set if t in correlations.columns]
+    if not book_in_corr:
+        return {}
+    avg_corr = correlations[book_in_corr].mean(axis=1, skipna=True)
+    return {str(k): float(v) for k, v in avg_corr.dropna().items() if k not in book_set}
 
 
 def calculate_atr_for_signal(
@@ -224,7 +263,11 @@ def build_regime_gate(
         block_reasons.append("volatility_percentile_above_80")
     if regime.divergence >= STRICT_NO_OPERATE_DIVERGENCE:
         block_reasons.append("regime_divergence_high")
-    if data_staleness and data_staleness.get("is_stale"):
+    trading_days_behind = (data_staleness or {}).get("trading_days_behind")
+    blocking_staleness = bool(data_staleness and data_staleness.get("is_stale")) and (
+        trading_days_behind is None or int(trading_days_behind) > 1
+    )
+    if blocking_staleness:
         block_reasons.append("data_stale")
 
     return {
@@ -292,6 +335,7 @@ def build_paper_trading_signals(
     data_staleness: dict | None = None,
     ticker_exposure: dict[str, float] | None = None,
     sector_exposure: dict[str, float] | None = None,
+    book_correlation: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     if predictions.empty or features.empty:
         return pd.DataFrame()
@@ -367,6 +411,7 @@ def build_paper_trading_signals(
             current_ticker_exposure_brl=ticker_exposure.get(str(row.ticker), 0.0),
             current_sector_exposure_brl=sector_exposure.get(sector, 0.0),
             max_risk_per_trade=policy.max_risk_per_trade,
+            avg_book_correlation=book_correlation.get(str(row.ticker), 0.0),
         )
         stop_loss = sizing.stop_price
         stop_distance = sizing.stop_distance_pct
@@ -446,7 +491,6 @@ def build_paper_trading_signals(
             "regime_gate": regime_gate,
             "strategy_gate": strategy_gate,
             "signal_version": PAPER_SIGNAL_VERSION,
-            "language_guardrail": "Experimental paper-trading thesis only. Not financial advice and not a real order.",
         }
         operational_action = (
             OPERATIONAL_ACTION_LEGACY_SIMULATE
@@ -548,6 +592,251 @@ def choose_operational_action(
     return operational_action, "no_operate", ",".join(block_reasons) or None
 
 
+def build_trade_outcome_strategy_gate(trade_outcome_predictions: pd.DataFrame) -> dict:
+    if trade_outcome_predictions.empty:
+        return {
+            "passed": False,
+            "reason": "trade_outcome_predictions_empty",
+            "gate_type": "trade_outcome_model_gate",
+        }
+    run_id = str(trade_outcome_predictions["run_id"].iloc[0])
+    runs = get_trade_outcome_runs()
+    selected = runs[runs["run_id"].astype(str).eq(run_id)] if not runs.empty else pd.DataFrame()
+    if selected.empty:
+        return {
+            "passed": False,
+            "reason": "trade_outcome_run_metadata_missing",
+            "gate_type": "trade_outcome_model_gate",
+            "run_id": run_id,
+        }
+    latest = selected.iloc[0]
+    simulated_trades = int(latest.get("simulated_test_trades") or 0)
+    simulated_avg_return = float(latest.get("simulated_test_avg_return") or 0.0)
+    simulated_win_rate = float(latest.get("simulated_test_win_rate") or 0.0)
+    gate_checks = {
+        "trade_outcome_min_test_trades": simulated_trades >= MIN_TRADE_OUTCOME_TEST_TRADES,
+        "trade_outcome_avg_return_positive": simulated_avg_return > 0.0,
+        "trade_outcome_win_rate_acceptable": simulated_win_rate >= MIN_TRADE_OUTCOME_TEST_WIN_RATE,
+    }
+    failed_checks = [name for name, passed in gate_checks.items() if not passed]
+    return {
+        "passed": not failed_checks,
+        "reason": None if not failed_checks else ",".join(f"{name}_failed" for name in failed_checks),
+        "gate_type": "trade_outcome_model_gate",
+        "run_id": run_id,
+        "threshold": 0.50,
+        "min_test_win_rate": MIN_TRADE_OUTCOME_TEST_WIN_RATE,
+        "simulated_test_trades": simulated_trades,
+        "simulated_test_avg_return": simulated_avg_return,
+        "simulated_test_win_rate": simulated_win_rate,
+        "gate_checks": gate_checks,
+    }
+
+
+def _score_technical_fallback_features(features: pd.DataFrame) -> pd.DataFrame:
+    if features.empty:
+        return pd.DataFrame()
+    scored = features.copy()
+    reference_price = scored["close"].astype(float)
+    trend_21 = reference_price / scored["ma_21"].astype(float).clip(lower=1e-9) - 1.0
+    trend_63 = reference_price / scored["ma_63"].astype(float).clip(lower=1e-9) - 1.0
+    trend_252 = reference_price / scored["ma_252"].astype(float).clip(lower=1e-9) - 1.0
+    return_21d = scored["return_21d"].astype(float).fillna(0.0)
+    rsi_14 = scored["rsi_14"].astype(float).fillna(50.0)
+    volatility_21d = scored["volatility_21d"].astype(float)
+    mean_reversion = ((50.0 - rsi_14) / 100.0).clip(-0.25, 0.25)
+    raw_probability_win = (
+        0.50
+        + 1.20 * return_21d
+        + 0.75 * trend_63
+        + 0.35 * trend_252
+        + 0.20 * mean_reversion
+        - 1.50 * np.maximum(volatility_21d - 0.035, 0.0)
+    )
+    probability_win = raw_probability_win.clip(0.05, 0.95)
+    probability_loss = (0.72 - probability_win + np.maximum(volatility_21d - 0.025, 0.0) * 2.0).clip(0.05, 0.90)
+    probability_timeout = (1.0 - probability_win - probability_loss).clip(0.0, 0.90)
+    probability_total = probability_win + probability_loss + probability_timeout
+    scored["technical_fallback_probability_win"] = probability_win / probability_total
+    scored["technical_fallback_probability_loss"] = probability_loss / probability_total
+    scored["technical_fallback_expected_return"] = (
+        0.45 * return_21d + 0.25 * trend_63 + 0.10 * trend_21 + 0.05 * mean_reversion
+    ).clip(-0.12, 0.12)
+    scored["technical_fallback_edge"] = (
+        scored["technical_fallback_probability_win"] - scored["technical_fallback_probability_loss"]
+    )
+    return scored
+
+
+def _select_technical_fallback_rows(
+    scored: pd.DataFrame,
+    threshold: float,
+    policy: PaperTradingPolicy,
+    holding_days: int = 7,
+) -> pd.DataFrame:
+    selected_rows: list[pd.Series] = []
+    ordered_scores = scored.sort_values(["ticker", "date"]).reset_index(drop=True)
+    for _ticker, ticker_scores in ordered_scores.groupby("ticker", sort=False):
+        ticker_scores = ticker_scores.reset_index(drop=True)
+        index = 0
+        while index < len(ticker_scores):
+            row = ticker_scores.iloc[index]
+            if (
+                float(row["technical_fallback_probability_win"]) >= threshold
+                and float(row["technical_fallback_edge"]) >= 0.05
+                and float(row["technical_fallback_expected_return"]) > 0.0
+                and float(row["volatility_21d"]) <= policy.max_volatility_21d
+            ):
+                selected_rows.append(row)
+                index += holding_days
+            else:
+                index += 1
+    return pd.DataFrame(selected_rows)
+
+
+def _summarize_technical_fallback_rows(trades: pd.DataFrame) -> dict:
+    if trades.empty:
+        return {
+            "trades": 0,
+            "win_rate": 0.0,
+            "cumulative_return": 0.0,
+            "average_trade_return": 0.0,
+            "traded_tickers": 0,
+            "profitable_tickers": 0,
+        }
+    returns = trades["technical_fallback_net_return"].astype(float)
+    equity_curve = (1.0 + returns).cumprod()
+    per_ticker = trades.groupby("ticker")["technical_fallback_net_return"].sum()
+    return {
+        "trades": int(len(trades)),
+        "win_rate": float((returns > 0.0).mean()),
+        "cumulative_return": float(equity_curve.iloc[-1] - 1.0),
+        "average_trade_return": float(returns.mean()),
+        "traded_tickers": int(trades["ticker"].nunique()),
+        "profitable_tickers": int((per_ticker > 0.0).sum()),
+    }
+
+
+def build_technical_fallback_strategy_gate(policy: PaperTradingPolicy) -> dict:
+    historical_features = read_technical_features()
+    if historical_features.empty or "target_return_7d" not in historical_features.columns:
+        return {
+            "passed": False,
+            "reason": "technical_fallback_history_missing",
+            "gate_type": "technical_fallback_historical_gate",
+        }
+    scored = _score_technical_fallback_features(historical_features)
+    scored = scored.dropna(
+        subset=[
+            "technical_fallback_probability_win",
+            "technical_fallback_probability_loss",
+            "technical_fallback_expected_return",
+            "technical_fallback_edge",
+            "target_return_7d",
+            "volatility_21d",
+        ]
+    ).copy()
+    if scored.empty:
+        return {
+            "passed": False,
+            "reason": "technical_fallback_scores_empty",
+            "gate_type": "technical_fallback_historical_gate",
+        }
+    cost_breakdown = compute_cost_breakdown(notional_brl=policy.portfolio_value)
+    gross_net_return = scored["target_return_7d"].astype(float) - cost_breakdown.total_pre_ir
+    scored["technical_fallback_net_return"] = np.where(
+        gross_net_return > 0.0,
+        gross_net_return * (1.0 - cost_breakdown.ir_on_profit_rate),
+        gross_net_return,
+    )
+    validation_scores = scored[scored["time_split"].eq("validation")].copy()
+    test_scores = scored[scored["time_split"].eq("test")].copy()
+    threshold_records: list[dict] = []
+    for threshold in TECHNICAL_FALLBACK_THRESHOLD_GRID:
+        validation_trades = _select_technical_fallback_rows(validation_scores, threshold, policy)
+        metrics = _summarize_technical_fallback_rows(validation_trades)
+        metrics["threshold"] = float(threshold)
+        threshold_records.append(metrics)
+    threshold_grid = pd.DataFrame(threshold_records)
+    candidates = threshold_grid[
+        (threshold_grid["trades"] >= MIN_TECHNICAL_FALLBACK_TRADES)
+        & (threshold_grid["average_trade_return"] > 0.0)
+        & (threshold_grid["cumulative_return"] > 0.0)
+    ].copy()
+    if candidates.empty:
+        return {
+            "passed": False,
+            "reason": "technical_fallback_validation_edge_failed",
+            "gate_type": "technical_fallback_historical_gate",
+            "threshold_grid": threshold_records,
+        }
+    selected = candidates.sort_values(
+        ["average_trade_return", "cumulative_return", "trades"],
+        ascending=[False, False, False],
+    ).iloc[0]
+    selected_threshold = float(selected["threshold"])
+    test_trades = _select_technical_fallback_rows(test_scores, selected_threshold, policy)
+    test_metrics = _summarize_technical_fallback_rows(test_trades)
+    gate_checks = {
+        "technical_fallback_test_min_trades": test_metrics["trades"] >= MIN_TECHNICAL_FALLBACK_TRADES,
+        "technical_fallback_test_return_positive": test_metrics["cumulative_return"] > 0.0,
+        "technical_fallback_test_avg_return_positive": test_metrics["average_trade_return"] > 0.0,
+        "technical_fallback_profitable_tickers_acceptable": (
+            test_metrics["profitable_tickers"] >= MIN_TECHNICAL_FALLBACK_PROFITABLE_TICKERS
+        ),
+    }
+    failed_checks = [name for name, passed in gate_checks.items() if not passed]
+    return {
+        "passed": not failed_checks,
+        "reason": None if not failed_checks else ",".join(f"{name}_failed" for name in failed_checks),
+        "gate_type": "technical_fallback_historical_gate",
+        "threshold": selected_threshold,
+        "validation_selection": selected.to_dict(),
+        "test_metrics": test_metrics,
+        "gate_checks": gate_checks,
+    }
+
+
+def build_directional_strategy_gate(
+    *,
+    run_id: str,
+    holding_days: int,
+    cost_per_trade: float,
+    portfolio_value: float,
+) -> dict:
+    walk_forward = run_walk_forward_backtest(
+        run_id=run_id,
+        holding_days=holding_days,
+        cost_per_trade=cost_per_trade,
+        use_b3_costs=True,
+        notional_brl=portfolio_value,
+    )
+    passed = bool(walk_forward["strategy_gate_passed"])
+    failed_checks = [
+        f"{name}_failed"
+        for name, check_passed in walk_forward.get("gate_checks", {}).items()
+        if not check_passed
+    ]
+    reason = None if passed else ",".join(failed_checks) or walk_forward["strategy_gate_reason"]
+    return {
+        "passed": passed,
+        "reason": reason,
+        "gate_type": "directional_walk_forward_gate",
+        "backtest_id": walk_forward["backtest_id"],
+        "threshold": walk_forward["threshold"],
+        "trades": walk_forward["trades"],
+        "cumulative_return": walk_forward["cumulative_return"],
+        "buy_hold_return_avg": walk_forward["buy_hold_return_avg"],
+        "max_drawdown": walk_forward["max_drawdown"],
+        "passing_windows": walk_forward["passing_windows"],
+        "total_windows": walk_forward["total_windows"],
+        "passing_window_ratio": walk_forward["passing_window_ratio"],
+        "traded_tickers": walk_forward["traded_tickers"],
+        "profitable_tickers": walk_forward["profitable_tickers"],
+        "gate_checks": walk_forward["gate_checks"],
+    }
+
+
 def build_trade_outcome_paper_signals(
     trade_outcome_predictions: pd.DataFrame,
     features: pd.DataFrame,
@@ -561,6 +850,7 @@ def build_trade_outcome_paper_signals(
     data_staleness: dict | None = None,
     ticker_exposure: dict[str, float] | None = None,
     sector_exposure: dict[str, float] | None = None,
+    book_correlation: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     if trade_outcome_predictions.empty or features.empty:
         return pd.DataFrame()
@@ -569,6 +859,7 @@ def build_trade_outcome_paper_signals(
     prices = prices if prices is not None else read_ohlcv_prices()
     ticker_exposure = ticker_exposure or {}
     sector_exposure = sector_exposure or {}
+    book_correlation = book_correlation or {}
     feature_columns = ["ticker", "date", "close", "volatility_21d"]
     merged = trade_outcome_predictions.merge(
         features[feature_columns],
@@ -634,6 +925,7 @@ def build_trade_outcome_paper_signals(
             current_ticker_exposure_brl=ticker_exposure.get(ticker, 0.0),
             current_sector_exposure_brl=sector_exposure.get(sector, 0.0),
             max_risk_per_trade=policy.max_risk_per_trade,
+            avg_book_correlation=book_correlation.get(ticker, 0.0),
         )
         stop_distance = sizing.stop_distance_pct
         target_distance = max(target_distance, stop_distance * policy.min_reward_risk_ratio)
@@ -732,9 +1024,6 @@ def build_trade_outcome_paper_signals(
             "regime_gate": regime_gate,
             "strategy_gate": strategy_gate,
             "signal_version": PAPER_SIGNAL_VERSION,
-            "language_guardrail": (
-                "Experimental paper-trading thesis only. Not financial advice and not a real order."
-            ),
         }
         signal_records.append(
             {
@@ -783,6 +1072,7 @@ def build_technical_fallback_paper_signals(
     data_staleness: dict | None = None,
     ticker_exposure: dict[str, float] | None = None,
     sector_exposure: dict[str, float] | None = None,
+    book_correlation: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     if features.empty:
         return pd.DataFrame()
@@ -790,6 +1080,7 @@ def build_technical_fallback_paper_signals(
     prices = prices if prices is not None else read_ohlcv_prices()
     ticker_exposure = ticker_exposure or {}
     sector_exposure = sector_exposure or {}
+    book_correlation = book_correlation or {}
     qualitative_features = get_qualitative_features()
     strategy_gate = strategy_gate or {
         "passed": True,
@@ -870,6 +1161,7 @@ def build_technical_fallback_paper_signals(
             current_ticker_exposure_brl=ticker_exposure.get(ticker, 0.0),
             current_sector_exposure_brl=sector_exposure.get(sector, 0.0),
             max_risk_per_trade=policy.max_risk_per_trade,
+            avg_book_correlation=book_correlation.get(ticker, 0.0),
         )
         stop_distance = sizing.stop_distance_pct
         target_distance = max(target_distance, stop_distance * policy.min_reward_risk_ratio)
@@ -895,6 +1187,7 @@ def build_technical_fallback_paper_signals(
             policy=policy,
             strategy_gate_passed=bool(strategy_gate["passed"]),
             strategy_gate_reason=strategy_gate["reason"],
+            enter_long_min_probability_win=float(strategy_gate.get("threshold") or 0.50),
             strict_block_reasons=strict_block_reasons,
         )
         thesis = {
@@ -954,7 +1247,6 @@ def build_technical_fallback_paper_signals(
             "regime_gate": regime_gate,
             "strategy_gate": strategy_gate,
             "signal_version": PAPER_SIGNAL_VERSION,
-            "language_guardrail": "Experimental paper-trading thesis only. Not financial advice and not a real order.",
         }
         signal_records.append(
             {
@@ -1015,41 +1307,20 @@ def generate_paper_trading_signals(
         max_volatility_21d=max_volatility_21d,
         require_strategy_edge=require_strategy_edge,
     )
-    strategy_gate = {
+    directional_strategy_gate = {
         "passed": True,
         "reason": None,
+        "gate_type": "not_required",
         "backtest_id": None,
         "cumulative_return": None,
         "buy_hold_return_avg": None,
     }
-    if require_strategy_edge:
-        walk_forward = run_walk_forward_backtest(
-            run_id=selected_run_id,
-            holding_days=7,
-            cost_per_trade=cost_per_trade,
-            use_b3_costs=True,
-            notional_brl=portfolio_value,
-        )
-        passed = bool(walk_forward["strategy_gate_passed"])
-        reason = None if passed else walk_forward["strategy_gate_reason"]
-        strategy_gate = {
-            "passed": passed,
-            "reason": reason,
-            "backtest_id": walk_forward["backtest_id"],
-            "threshold": walk_forward["threshold"],
-            "trades": walk_forward["trades"],
-            "cumulative_return": walk_forward["cumulative_return"],
-            "buy_hold_return_avg": walk_forward["buy_hold_return_avg"],
-            "max_drawdown": walk_forward["max_drawdown"],
-            "passing_windows": walk_forward["passing_windows"],
-            "total_windows": walk_forward["total_windows"],
-            "passing_window_ratio": walk_forward["passing_window_ratio"],
-            "traded_tickers": walk_forward["traded_tickers"],
-            "profitable_tickers": walk_forward["profitable_tickers"],
-            "gate_checks": walk_forward["gate_checks"],
-        }
     prices = read_ohlcv_prices()
     ticker_exposure, sector_exposure = current_open_exposures(portfolio_value)
+    book_correlation = build_book_correlation_lookup(
+        prices=prices,
+        book_tickers=list(ticker_exposure.keys()),
+    )
     try:
         from app.pipelines.refresh import detect_staleness
 
@@ -1059,6 +1330,11 @@ def generate_paper_trading_signals(
     trade_outcome_predictions = read_latest_operational_trade_outcomes()
     current_features = build_current_technical_features(prices)
     if not trade_outcome_predictions.empty:
+        strategy_gate = (
+            build_trade_outcome_strategy_gate(trade_outcome_predictions)
+            if require_strategy_edge
+            else directional_strategy_gate
+        )
         signals = build_trade_outcome_paper_signals(
             trade_outcome_predictions,
             current_features,
@@ -1069,6 +1345,7 @@ def generate_paper_trading_signals(
             data_staleness=data_staleness,
             ticker_exposure=ticker_exposure,
             sector_exposure=sector_exposure,
+            book_correlation=book_correlation,
         )
         signal_source = "operational_trade_outcomes"
     else:
@@ -1081,6 +1358,16 @@ def generate_paper_trading_signals(
             predictions = operational_predictions.copy()
             features = current_features
             signal_source = "operational_predictions"
+        strategy_gate = (
+            build_directional_strategy_gate(
+                run_id=selected_run_id,
+                holding_days=7,
+                cost_per_trade=cost_per_trade,
+                portfolio_value=portfolio_value,
+            )
+            if require_strategy_edge
+            else directional_strategy_gate
+        )
         signals = build_paper_trading_signals(
             predictions,
             features,
@@ -1092,18 +1379,25 @@ def generate_paper_trading_signals(
             data_staleness=data_staleness,
             ticker_exposure=ticker_exposure,
             sector_exposure=sector_exposure,
+            book_correlation=book_correlation,
         )
     covered_tickers = set() if signals.empty else set(signals["ticker"].astype(str))
     uncovered_features = current_features[~current_features["ticker"].astype(str).isin(covered_tickers)].copy()
+    fallback_strategy_gate = (
+        build_technical_fallback_strategy_gate(policy)
+        if require_strategy_edge
+        else directional_strategy_gate
+    )
     fallback_signals = build_technical_fallback_paper_signals(
         uncovered_features,
         selected_run_id,
         policy,
-        strategy_gate,
+        fallback_strategy_gate,
         prices=prices,
         data_staleness=data_staleness,
         ticker_exposure=ticker_exposure,
         sector_exposure=sector_exposure,
+        book_correlation=book_correlation,
     )
     if not fallback_signals.empty:
         signals = fallback_signals if signals.empty else pd.concat([signals, fallback_signals], ignore_index=True)
@@ -1128,6 +1422,7 @@ def generate_paper_trading_signals(
         "simulate_long": simulated,
         "no_operate": blocked,
         "strategy_gate": strategy_gate,
+        "fallback_strategy_gate": fallback_strategy_gate,
         "signal_source": signal_source,
         "operational_actions": operational_breakdown,
     }

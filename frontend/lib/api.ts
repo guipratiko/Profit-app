@@ -44,8 +44,28 @@ export type FusionPrediction = {
   fused_direction?: string;
   explanation_json?: string;
 };
+export type TechnicalPrediction = {
+  run_id?: string;
+  ticker: string;
+  date?: string;
+  target_name?: string;
+  predicted_direction?: string;
+  probability_down?: number;
+  probability_sideways?: number;
+  probability_up?: number;
+  expected_return?: number;
+  calibration_method?: string;
+  inference_version?: string;
+  conformal_interval_low?: number;
+  conformal_interval_high?: number;
+  conformal_alpha?: number;
+  conformal_quantile?: number;
+};
 export type PredictionPayload = {
   ticker: string;
+  model_run_id?: string | null;
+  status?: string;
+  technical_prediction?: TechnicalPrediction | null;
   fusion_prediction?: FusionPrediction | null;
   paper_signal?: PaperSignal | null;
 };
@@ -139,7 +159,7 @@ export const api = {
   positions: () => request<{ positions: Position[] }>("/portfolio/positions?limit=200"),
   alerts: () => request<{ alerts: RiskAlert[] }>("/portfolio/alerts?limit=200"),
   auditConselheiro: () => request<Record<string, unknown>>("/portfolio/audit-conselheiro", { method: "POST" }),
-  realPositions: () => request<{ positions: RealPosition[]; risk_notice?: string }>('/portfolio/real/positions?limit=200'),
+  realPositions: () => request<{ positions: RealPosition[] }>('/portfolio/real/positions?limit=200'),
   registerRealPosition: (payload: RealPositionCreateInput) => request<Record<string, unknown>>('/portfolio/real/register', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -151,16 +171,23 @@ export const api = {
     body: JSON.stringify(payload)
   }),
   deleteRealPosition: (positionId: string) => request<Record<string, unknown>>(`/portfolio/real/${positionId}`, { method: 'DELETE' }),
-  markToMarket: () => request<Record<string, unknown>>('/portfolio/mark-to-market', { method: 'POST' }),
+  markToMarket: (options?: { refreshPrices?: boolean; refreshPeriod?: string }) => request<Record<string, unknown>>(
+    withQuery('/portfolio/mark-to-market', {
+      refresh_prices: options?.refreshPrices,
+      refresh_period: options?.refreshPeriod
+    }),
+    { method: 'POST' }
+  ),
   alphaMetrics: () => request<Record<string, any>>("/alpha/metrics"),
   paperGate: () => request<Record<string, any>>("/validation/paper-gate"),
   refreshStatus: () => request<Record<string, unknown>>("/refresh/status"),
-  refreshRun: (options?: { maxStalenessDays?: number; refitWindowDays?: number; skipPriceUpdate?: boolean; asyncMode?: boolean }) => request<Record<string, unknown>>(
+  refreshRun: (options?: { maxStalenessDays?: number; refitWindowDays?: number; skipPriceUpdate?: boolean; asyncMode?: boolean; forceRefresh?: boolean }) => request<Record<string, unknown>>(
     withQuery("/refresh/run", {
       max_staleness_days: options?.maxStalenessDays,
       refit_window_days: options?.refitWindowDays,
       skip_price_update: options?.skipPriceUpdate,
-      async_mode: options?.asyncMode
+      async_mode: options?.asyncMode,
+      force_refresh: options?.forceRefresh
     }),
     { method: "POST" }
   )

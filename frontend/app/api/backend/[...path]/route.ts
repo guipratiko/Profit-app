@@ -8,7 +8,7 @@ type RouteContext = {
 };
 
 function getBackendBaseUrl() {
-  return process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "";
+  return process.env.BACKEND_API_BASE_URL?.trim() || process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "";
 }
 
 function buildBackendUrl(request: NextRequest, path: string[]) {

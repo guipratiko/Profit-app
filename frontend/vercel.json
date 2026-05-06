@@ -1,6 +1,12 @@
 {
   "framework": "nextjs",
+  "regions": ["gru1"],
   "buildCommand": "npm run build",
   "devCommand": "npm run dev",
-  "installCommand": "npm install"
+  "installCommand": "npm ci",
+  "functions": {
+    "app/api/backend/[...path]/route.ts": {
+      "maxDuration": 60
+    }
+  }
 }

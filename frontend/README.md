@@ -21,7 +21,8 @@ npm run dev -- --port 3000
 
 1. Create a Vercel project with root directory set to `frontend`.
 2. Add environment variable `NEXT_PUBLIC_API_BASE_URL` pointing to the deployed FastAPI backend.
-3. Deploy with the default Next.js build command: `npm run build`.
+3. Optionally add `BACKEND_API_BASE_URL` with the same backend URL for the server-side proxy route.
+4. Deploy with `npm ci` and `npm run build`.
 
 The production frontend intentionally requires `NEXT_PUBLIC_API_BASE_URL`. If it is missing, the UI will render a clear configuration error instead of attempting to call `127.0.0.1` from the user's browser.
 
@@ -37,4 +38,4 @@ For local testing, the backend defaults to permissive CORS.
 
 ## Important Runtime Note
 
-This repository uses Vercel for the Next.js frontend only. The current FastAPI backend should run on a separate Python host because it depends on local SQLite state, model artifacts on disk, and heavy ML runtimes that are not a good fit for Vercel serverless execution.
+This repository uses Vercel for the Next.js frontend only. The current FastAPI backend should run on a separate Python host because it depends on PostgreSQL, model artifacts on disk, and heavier ML runtimes that are not a good fit for Vercel serverless execution.

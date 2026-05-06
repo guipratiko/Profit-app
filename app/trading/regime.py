@@ -17,7 +17,10 @@ This module is pure-function and stateless so it can be called from
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+import numpy as np
+import pandas as pd
 
 
 VOL_NORMAL_PERCENTILE_HIGH = 0.80  # > p80 vol → narrative regime contribution
@@ -123,5 +126,137 @@ def assess_regime(
         volatility_percentile=float(volatility_percentile),
         event_magnitude=float(event_magnitude),
         divergence=divergence,
+        notes=notes,
+    )
+
+# ---------------------------------------------------------------------------
+# HMM-based market regime overlay (P4)
+# ---------------------------------------------------------------------------
+# Heuristic narrative_pressure works on per-ticker context (vol percentile +
+# event load). We complement it with a market-wide hidden-state model fitted
+# on the cross-sectional median return + median 21d realised vol. The state
+# with the lowest mean return is labelled ``bear``, the highest ``bull``,
+# and the middle one ``chop``. The current state's posterior probability
+# then biases the per-ticker assessment via :func:`apply_hmm_overlay`.
+# hmmlearn is an optional dependency; if missing we silently skip the overlay.
+
+_HMM_LABELS = ("bear", "chop", "bull")
+
+
+def _build_market_observation_panel(prices: pd.DataFrame) -> pd.DataFrame:
+    if prices is None or prices.empty:
+        return pd.DataFrame()
+    needed = {"date", "ticker", "close"}
+    if not needed.issubset(prices.columns):
+        return pd.DataFrame()
+    df = prices[["date", "ticker", "close"]].copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date", "close"])
+    if df.empty:
+        return pd.DataFrame()
+    pivot = df.pivot_table(
+        index="date", columns="ticker", values="close", aggfunc="last"
+    ).sort_index()
+    returns = pivot.pct_change()
+    median_return = returns.median(axis=1)
+    realised_vol = returns.rolling(window=21, min_periods=10).std().median(axis=1)
+    panel = pd.DataFrame(
+        {
+            "median_return": median_return,
+            "realised_vol": realised_vol,
+        }
+    ).dropna()
+    return panel
+
+
+def fit_market_hmm(prices: pd.DataFrame, n_states: int = 3) -> dict | None:
+    """Fit a Gaussian HMM on cross-sectional market dynamics.
+
+    Returns a dict with the current state's label, posterior probabilities and
+    the per-state mean return. Returns ``None`` when ``hmmlearn`` is missing,
+    when the panel is too short, or when fitting fails.
+    """
+    try:
+        from hmmlearn.hmm import GaussianHMM  # type: ignore
+    except Exception:
+        return None
+    panel = _build_market_observation_panel(prices)
+    if len(panel) < max(80, n_states * 30):
+        return None
+    observations = panel.to_numpy(dtype="float64")
+    try:
+        model = GaussianHMM(
+            n_components=int(n_states),
+            covariance_type="diag",
+            n_iter=200,
+            random_state=42,
+            tol=1e-3,
+        )
+        model.fit(observations)
+        posteriors = model.predict_proba(observations)
+    except Exception:
+        return None
+    means = model.means_[:, 0]
+    order = np.argsort(means)
+    if len(order) >= 3:
+        labels = {int(order[0]): "bear", int(order[1]): "chop", int(order[-1]): "bull"}
+    elif len(order) == 2:
+        labels = {int(order[0]): "bear", int(order[1]): "bull"}
+    else:
+        labels = {int(order[0]): "chop"}
+    last_post = posteriors[-1]
+    state_probabilities = {
+        labels.get(i, f"state_{i}"): float(last_post[i]) for i in range(len(last_post))
+    }
+    current_state = max(state_probabilities, key=state_probabilities.get)
+    return {
+        "current_state": current_state,
+        "state_probabilities": state_probabilities,
+        "state_means": {labels.get(i, f"state_{i}"): float(means[i]) for i in range(len(means))},
+        "n_observations": int(len(panel)),
+        "method": "gaussian_hmm_v1",
+    }
+
+
+def apply_hmm_overlay(
+    assessment: RegimeAssessment,
+    hmm_state: dict | None,
+) -> RegimeAssessment:
+    """Adjust the heuristic assessment with the HMM market state.
+
+    * ``bear`` market with high posterior ? push toward narrative regime,
+      down-weight the technical signal.
+    * ``bull`` market with high posterior ? reinforce technical regime.
+    * ``chop`` keeps the heuristic verdict.
+
+    The assessment's :attr:`override_qualitative` flag is never lowered: if
+    the heuristic already triggered an override, the HMM cannot retract it.
+    """
+    if not hmm_state:
+        return assessment
+    label = hmm_state.get("current_state")
+    posterior = float(hmm_state.get("state_probabilities", {}).get(label, 0.0))
+    if posterior < 0.55:
+        return assessment
+
+    notes = list(assessment.notes) + [f"hmm_state:{label}:{posterior:.2f}"]
+    technical_weight = assessment.technical_weight
+    qualitative_weight = assessment.qualitative_weight
+    regime = assessment.regime
+    if label == "bear":
+        technical_weight = max(0.20, assessment.technical_weight - 0.20)
+        qualitative_weight = 1.0 - technical_weight
+        if regime == "technical":
+            regime = "mixed"
+    elif label == "bull":
+        technical_weight = min(0.95, assessment.technical_weight + 0.10)
+        qualitative_weight = 1.0 - technical_weight
+        if regime == "narrative" and not assessment.override_qualitative:
+            regime = "mixed"
+    return replace(
+        assessment,
+        regime=regime,
+        technical_weight=float(technical_weight),
+        qualitative_weight=float(qualitative_weight),
         notes=notes,
     )

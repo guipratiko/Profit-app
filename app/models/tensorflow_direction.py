@@ -42,6 +42,10 @@ RAW_FEATURE_COLUMNS = [
     "volume_ratio_21d",
     "drawdown_252d",
     "rsi_14",
+    "atr_pct_14",
+    "gap_pct",
+    "candle_body_pct",
+    "range_pct_21d",
 ]
 MODEL_FEATURE_COLUMNS = [
     "return_1d",
@@ -61,6 +65,19 @@ MODEL_FEATURE_COLUMNS = [
     "ma_63_to_ma_252",
     "volatility_21_to_63",
     "return_21d_to_volatility",
+    "atr_pct_14",
+    "gap_pct",
+    "candle_body_pct",
+    "range_pct_21d",
+    "return_relative_market_21d",
+    # --- v2 cross-asset / regime / volume features (added 2026-05) ---
+    "index_spy_return_5d",
+    "index_qqq_return_5d",
+    "index_bvsp_return_5d",
+    "relative_strength_5d",
+    "vol_of_vol_21d",
+    "obv_slope_21d",
+    "breadth_above_ma200",
 ]
 
 
@@ -142,6 +159,12 @@ def add_model_features(dataset: pd.DataFrame) -> pd.DataFrame:
     prepared["ma_63_to_ma_252"] = prepared["ma_63"] / prepared["ma_252"] - 1.0
     prepared["volatility_21_to_63"] = prepared["volatility_21d"] / prepared["volatility_63d"].clip(lower=1e-9)
     prepared["return_21d_to_volatility"] = prepared["return_21d"] / prepared["volatility_63d"].clip(lower=1e-9)
+
+    if "date" in prepared.columns:
+        market_return_21d = prepared.groupby("date")["return_21d"].transform("median")
+    else:
+        market_return_21d = prepared["return_21d"].median()
+    prepared["return_relative_market_21d"] = prepared["return_21d"].astype("float64") - market_return_21d.astype("float64")
 
     for ticker in INITIAL_ASSETS:
         prepared[ticker_feature_name(ticker)] = (prepared["ticker"] == ticker).astype("float32")

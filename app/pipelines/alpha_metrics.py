@@ -3,7 +3,7 @@
 Pulls together the metrics the methodology document requires for the alpha
 layer: directional accuracy, cumulative return, drawdown, win rate, gain/loss
 averages, risk/reward ratio, comparison vs buy & hold, count of "no operate"
-signals.  All numbers come from artefacts already stored in SQLite, so the
+signals.  All numbers come from artefacts already stored in the database, so the
 endpoint is fast and read-only.
 """
 
@@ -218,9 +218,4 @@ def build_alpha_metrics() -> dict:
         "paper_portfolio": paper_portfolio_summary(),
         "paper_validation_gate": build_paper_validation_report(),
         "buy_and_hold": buy_and_hold_baseline(),
-        "language_guardrail": (
-            "Experimental alpha metrics for paper-trading study only. "
-            "Past performance is not indicative of future results and these "
-            "numbers are not a recommendation."
-        ),
     }

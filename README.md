@@ -1,10 +1,10 @@
 # Profit App
 
-Alpha experimental para avaliacao e predicao de investimentos na B3 usando dados reais, paper trading, eventos/noticias e controle de risco.
+Alpha operacional para avaliacao e predicao de investimentos na B3 usando dados reais, sinais, eventos/noticias e controle de risco.
 
-## Aviso
+## Status Operacional
 
-Este projeto e educacional e experimental. As previsoes geradas nao constituem recomendacao financeira profissional. A primeira versao opera apenas com coleta de dados e simulacao.
+O sistema gera previsoes, teses operacionais, backtests, walk-forward validation, acompanhamento de carteira e auditoria de risco com criterios quantitativos versionados.
 
 ## Sprint atual
 
@@ -38,8 +38,48 @@ Para reaproveitar modelos ja treinados e apenas recalcular inferencias/sinais:
 - ITUB4.SA
 - BBDC4.SA
 - BBAS3.SA
+- SANB11.SA
+- B3SA3.SA
+- BPAC11.SA
 - ABEV3.SA
+- MGLU3.SA
+- LREN3.SA
+- RENT3.SA
+- RAIL3.SA
 - WEGE3.SA
+- EQTL3.SA
+- SBSP3.SA
+- RDOR3.SA
+- HAPV3.SA
+- SUZB3.SA
+- KLBN11.SA
+- CSNA3.SA
+- GGBR4.SA
+- USIM5.SA
+- NVDC34.SA
+- AAPL
+- MSFT
+- GOOGL
+- AMZN
+- NVDA
+- META
+- TSLA
+- AMD
+- AVGO
+- ORCL
+- CRM
+- JPM
+- BAC
+- GS
+- WMT
+- COST
+- HD
+- XOM
+- CVX
+- JNJ
+- UNH
+
+`ELET3.SA` and `CPLE6.SA` were removed from the monitored universe because Yahoo Finance currently does not provide reliable OHLCV/quote data for them in this environment.
 
 ## Como atualizar os dados
 
@@ -59,7 +99,7 @@ Para conferir quantas linhas foram salvas por ativo:
 .\.venv\Scripts\python.exe -m app.cli price-summary
 ```
 
-Por padrao, os dados sao salvos em `storage/profit_app.sqlite3`.
+Por padrao, os dados sao salvos no PostgreSQL configurado em `DATABASE_URL`.
 
 ## Como gerar features tecnicas
 
@@ -124,7 +164,7 @@ O paper trading usa essa validacao como trava operacional. Se o walk-forward rep
 
 ## Paper Trading Alpha
 
-Gera teses imutaveis de paper trading a partir do ultimo modelo treinado. O comando calcula decisao `simulate_long` ou `no_operate`, stop, alvo, custo estimado, risco maximo e tamanho maximo de posicao. Ele nao executa ordens reais. O status esperado pode ser `no_operate` mesmo com o gate historico aprovado, quando o sinal do dia nao tem qualidade suficiente.
+Gera teses imutaveis a partir do ultimo modelo treinado. O comando calcula decisao `simulate_long` ou `no_operate`, stop, alvo, custo estimado, risco maximo e tamanho maximo de posicao. O status esperado pode ser `no_operate` mesmo com o gate historico aprovado, quando o sinal do dia nao tem qualidade suficiente.
 
 ```powershell
 .\.venv311\Scripts\python.exe -m app.cli generate-paper-signals
@@ -198,7 +238,7 @@ Arquitetura validada para este projeto:
 - frontend Next.js no Vercel
 - backend FastAPI em um host Python dedicado
 
-O frontend foi preparado para Vercel, mas o backend atual nao deve ser publicado no Vercel se a expectativa for manter todas as funcionalidades operacionais. O motivo e estrutural: ele depende de SQLite local, artefatos de modelo em disco, `tensorflow`, `torch` e escrita de estado operacional, o que nao combina com o runtime serverless e efemero do Vercel.
+O frontend foi preparado para Vercel, enquanto o backend operacional deve rodar em um host Python dedicado. O motivo e estrutural: ele depende de PostgreSQL, artefatos de modelo em disco, `tensorflow`, `torch` e escrita de estado operacional, o que nao combina com o runtime serverless e efemero do Vercel.
 
 Configuracao minima do frontend em producao:
 
@@ -209,7 +249,7 @@ Sem `NEXT_PUBLIC_API_BASE_URL`, o frontend agora falha de forma explicita em pro
 
 ## Conselheiro de Risco
 
-Abre posicoes simuladas apenas a partir de teses `simulate_long`, avalia preco atual contra stop, alvo parcial e alvo principal, e salva alertas de risco. Ele nao executa ordens reais.
+Registra posicoes a partir de teses `simulate_long`, avalia preco atual contra stop, alvo parcial e alvo principal, e salva alertas de risco.
 
 ```powershell
 .\.venv311\Scripts\python.exe -m app.cli audit-portfolio

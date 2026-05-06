@@ -1,4 +1,3 @@
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -6,6 +5,11 @@ from typing import Iterable
 import pandas as pd
 
 from app.config import DATABASE_PATH, INITIAL_ASSETS, STORAGE_DIR
+try:
+    from app.config import CONTEXT_INDEX_TICKERS
+except ImportError:  # pragma: no cover - back-compat guard
+    CONTEXT_INDEX_TICKERS = {}
+from app.data.engine import LegacyConnection, get_engine, is_postgres
 
 
 SCHEMA_SQL = """
@@ -23,7 +27,7 @@ CREATE TABLE IF NOT EXISTS ohlcv_prices (
     low REAL,
     close REAL,
     adj_close REAL,
-    volume INTEGER,
+    volume BIGINT,
     source TEXT NOT NULL,
     downloaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (ticker, date),
@@ -34,7 +38,7 @@ CREATE TABLE IF NOT EXISTS technical_features (
     ticker TEXT NOT NULL,
     date TEXT NOT NULL,
     close REAL NOT NULL,
-    volume INTEGER,
+    volume BIGINT,
     return_1d REAL,
     return_5d REAL,
     return_21d REAL,
@@ -106,6 +110,10 @@ CREATE TABLE IF NOT EXISTS operational_predictions (
     expected_return REAL NOT NULL,
     calibration_method TEXT NOT NULL,
     inference_version TEXT NOT NULL,
+    conformal_interval_low REAL,
+    conformal_interval_high REAL,
+    conformal_alpha REAL,
+    conformal_quantile REAL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (run_id, ticker, date),
     FOREIGN KEY (run_id) REFERENCES model_runs(run_id),
@@ -332,38 +340,129 @@ PAPER_SIGNAL_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("probability_timeout", "REAL"),
 )
 
+TECHNICAL_FEATURE_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("atr_pct_14", "REAL"),
+    ("gap_pct", "REAL"),
+    ("candle_body_pct", "REAL"),
+    ("range_pct_21d", "REAL"),
+    ("target_enter_long_7d", "INTEGER"),
+    ("index_spy_return_5d", "REAL"),
+    ("index_qqq_return_5d", "REAL"),
+    ("index_bvsp_return_5d", "REAL"),
+    ("relative_strength_5d", "REAL"),
+    ("vol_of_vol_21d", "REAL"),
+    ("obv_slope_21d", "REAL"),
+    ("breadth_above_ma200", "REAL"),
+)
 
-def _apply_paper_signal_migrations(connection: sqlite3.Connection) -> None:
-    existing = {
-        row[1]
-        for row in connection.execute("PRAGMA table_info(paper_trading_signals)").fetchall()
-    }
+# Entry-snapshot columns capture the model state at the moment a real position is
+# registered. Persisted so the cockpit can later show "prob_win na entrada" vs
+# "prob_win agora" divergence without relying on volatile latest predictions.
+REAL_POSITION_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("entry_run_id", "TEXT"),
+    ("entry_probability_up", "REAL"),
+    ("entry_fused_score", "REAL"),
+    ("entry_regime", "TEXT"),
+    ("entry_intent_decision", "TEXT"),
+    ("entry_conformal_low", "REAL"),
+    ("entry_conformal_high", "REAL"),
+    ("entry_snapshot_json", "TEXT"),
+)
+
+# Split-conformal interval persisted on every operational prediction so the
+# fusion / cockpit layer can show calibrated uncertainty bands without recomputing.
+OPERATIONAL_PREDICTION_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("conformal_interval_low", "REAL"),
+    ("conformal_interval_high", "REAL"),
+    ("conformal_alpha", "REAL"),
+    ("conformal_quantile", "REAL"),
+)
+
+
+def _column_exists(connection: "LegacyConnection", table: str, column: str) -> bool:
+    sql = (
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = ? AND column_name = ?"
+    )
+    row = connection.execute(sql, (table, column)).fetchone()
+    return row is not None
+
+
+def _apply_paper_signal_migrations(connection: "LegacyConnection") -> None:
     for column, column_type in PAPER_SIGNAL_MIGRATIONS:
-        if column not in existing:
+        if not _column_exists(connection, "paper_trading_signals", column):
             connection.execute(
                 f"ALTER TABLE paper_trading_signals ADD COLUMN {column} {column_type}"
             )
 
 
-def get_connection(database_path: Path = DATABASE_PATH) -> sqlite3.Connection:
+def _apply_technical_feature_migrations(connection: "LegacyConnection") -> None:
+    for column, column_type in TECHNICAL_FEATURE_MIGRATIONS:
+        if not _column_exists(connection, "technical_features", column):
+            connection.execute(
+                f"ALTER TABLE technical_features ADD COLUMN {column} {column_type}"
+            )
+
+
+def _apply_real_position_migrations(connection: "LegacyConnection") -> None:
+    for column, column_type in REAL_POSITION_MIGRATIONS:
+        if not _column_exists(connection, "real_positions", column):
+            connection.execute(
+                f"ALTER TABLE real_positions ADD COLUMN {column} {column_type}"
+            )
+
+
+def _apply_operational_prediction_migrations(connection: "LegacyConnection") -> None:
+    for column, column_type in OPERATIONAL_PREDICTION_MIGRATIONS:
+        if not _column_exists(connection, "operational_predictions", column):
+            connection.execute(
+                f"ALTER TABLE operational_predictions ADD COLUMN {column} {column_type}"
+            )
+
+
+def get_connection(database_path: Path = DATABASE_PATH) -> "LegacyConnection":
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database_path, timeout=30.0)
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 30000")
-    try:
-        connection.execute("PRAGMA journal_mode = WAL")
-    except sqlite3.OperationalError:
-        pass
-    return connection
+    return LegacyConnection()
+
+
+def _read_sql_query(
+    connection: "LegacyConnection",
+    sql: str,
+    *legacy_args,
+    params=None,
+    **kwargs,
+) -> pd.DataFrame:
+    if legacy_args:
+        legacy_args = tuple(arg for arg in legacy_args if arg is not connection)
+    if legacy_args or kwargs:
+        raise TypeError("_read_sql_query only supports SQL text and params")
+    return connection.read_sql_query(sql, params=params)
 
 
 def initialize_database(database_path: Path = DATABASE_PATH) -> None:
     with get_connection(database_path) as connection:
         connection.executescript(SCHEMA_SQL)
         _apply_paper_signal_migrations(connection)
+        _apply_technical_feature_migrations(connection)
+        _apply_real_position_migrations(connection)
+        _apply_operational_prediction_migrations(connection)
         connection.executemany(
             "INSERT OR IGNORE INTO assets (ticker, name) VALUES (?, ?)",
             INITIAL_ASSETS.items(),
+        )
+
+
+def register_context_index_assets(database_path: Path = DATABASE_PATH) -> None:
+    """Insert CONTEXT_INDEX_TICKERS into the assets table so they satisfy the
+    ohlcv_prices.ticker FK without polluting the trading universe iterator.
+    Indices are downloaded for cross-asset features only.
+    """
+    if not CONTEXT_INDEX_TICKERS:
+        return
+    with get_connection(database_path) as connection:
+        connection.executemany(
+            "INSERT OR IGNORE INTO assets (ticker, name) VALUES (?, ?)",
+            CONTEXT_INDEX_TICKERS.items(),
         )
 
 
@@ -408,7 +507,7 @@ def upsert_ohlcv_prices(prices: pd.DataFrame, database_path: Path = DATABASE_PAT
 
 def get_price_counts(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT
                 ticker,
@@ -425,7 +524,7 @@ def get_price_counts(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
 
 def read_ohlcv_prices(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT
                 ticker,
@@ -467,55 +566,50 @@ def replace_technical_features(
         "volume_ratio_21d",
         "drawdown_252d",
         "rsi_14",
+        "atr_pct_14",
+        "gap_pct",
+        "candle_body_pct",
+        "range_pct_21d",
         "target_return_7d",
         "target_return_3m",
         "target_return_1y",
         "target_direction_7d",
         "target_direction_3m",
         "target_direction_1y",
+        "target_enter_long_7d",
+        "index_spy_return_5d",
+        "index_qqq_return_5d",
+        "index_bvsp_return_5d",
+        "relative_strength_5d",
+        "vol_of_vol_21d",
+        "obv_slope_21d",
+        "breadth_above_ma200",
         "time_split",
     ]
     records = features[required_columns].where(pd.notna(features), None).to_records(index=False).tolist()
 
-    with get_connection(database_path) as connection:
-        connection.execute("DELETE FROM technical_features")
-        connection.executemany(
-            """
+    placeholders = ", ".join(["?"] * len(required_columns))
+    column_list = ",\n                ".join(required_columns)
+
+    insert_sql = f"""
             INSERT INTO technical_features (
-                ticker,
-                date,
-                close,
-                volume,
-                return_1d,
-                return_5d,
-                return_21d,
-                ma_7,
-                ma_21,
-                ma_63,
-                ma_252,
-                volatility_21d,
-                volatility_63d,
-                volume_ratio_21d,
-                drawdown_252d,
-                rsi_14,
-                target_return_7d,
-                target_return_3m,
-                target_return_1y,
-                target_direction_7d,
-                target_direction_3m,
-                target_direction_1y,
-                time_split
+                {column_list}
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            records,
-        )
+            VALUES ({placeholders})
+            """
+
+    chunk_size = 5000
+    with get_connection(database_path) as connection:
+        _apply_technical_feature_migrations(connection)
+        connection.execute("DELETE FROM technical_features")
+        for start in range(0, len(records), chunk_size):
+            connection.executemany(insert_sql, records[start : start + chunk_size])
         return len(records)
 
 
 def get_feature_counts(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT
                 ticker,
@@ -533,7 +627,7 @@ def get_feature_counts(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
 
 def read_technical_features(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM technical_features
@@ -617,7 +711,7 @@ def save_model_run(
 
 def get_model_runs(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT
                 run_id,
@@ -679,7 +773,7 @@ def read_model_predictions(
     database_path: Path = DATABASE_PATH,
 ) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM model_predictions
@@ -713,8 +807,16 @@ def save_operational_predictions(
         "expected_return",
         "calibration_method",
         "inference_version",
+        "conformal_interval_low",
+        "conformal_interval_high",
+        "conformal_alpha",
+        "conformal_quantile",
     ]
-    records = predictions[required_columns].where(pd.notna(predictions), None).to_records(index=False).tolist()
+    prepared = predictions.copy()
+    for column in required_columns:
+        if column not in prepared.columns:
+            prepared[column] = None
+    records = prepared[required_columns].where(pd.notna(prepared), None).to_records(index=False).tolist()
 
     with get_connection(database_path) as connection:
         before = connection.total_changes
@@ -734,9 +836,13 @@ def save_operational_predictions(
                 raw_probability_up,
                 expected_return,
                 calibration_method,
-                inference_version
+                inference_version,
+                conformal_interval_low,
+                conformal_interval_high,
+                conformal_alpha,
+                conformal_quantile
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id, ticker, date) DO UPDATE SET
                 target_name = excluded.target_name,
                 predicted_direction = excluded.predicted_direction,
@@ -749,6 +855,10 @@ def save_operational_predictions(
                 expected_return = excluded.expected_return,
                 calibration_method = excluded.calibration_method,
                 inference_version = excluded.inference_version,
+                conformal_interval_low = excluded.conformal_interval_low,
+                conformal_interval_high = excluded.conformal_interval_high,
+                conformal_alpha = excluded.conformal_alpha,
+                conformal_quantile = excluded.conformal_quantile,
                 created_at = CURRENT_TIMESTAMP
             """,
             records,
@@ -761,7 +871,7 @@ def read_operational_predictions(
     database_path: Path = DATABASE_PATH,
 ) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM operational_predictions
@@ -775,7 +885,7 @@ def read_operational_predictions(
 
 def get_operational_predictions(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM operational_predictions
@@ -856,7 +966,7 @@ def save_backtest_run(
 
 def get_backtest_runs(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT
                 backtest_id,
@@ -870,7 +980,8 @@ def get_backtest_runs(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
                 cumulative_return,
                 average_trade_return,
                 max_drawdown,
-                buy_hold_return_avg
+                buy_hold_return_avg,
+                metadata_json
             FROM backtest_runs
             ORDER BY created_at DESC
             """,
@@ -989,7 +1100,7 @@ def save_paper_trading_signals(
 
 def get_paper_trading_signals(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM paper_trading_signals
@@ -1046,7 +1157,7 @@ def save_news_events(
 
 def get_news_events(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM news_events
@@ -1118,7 +1229,7 @@ def save_qualitative_features(
 
 def get_qualitative_features(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM qualitative_features
@@ -1188,7 +1299,7 @@ def save_fusion_predictions(
 
 def get_fusion_predictions(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM fusion_predictions
@@ -1264,7 +1375,7 @@ def save_paper_positions(
 
 def get_paper_positions(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM paper_positions
@@ -1291,6 +1402,14 @@ def save_real_positions(
         "current_price",
         "last_updated_at",
         "notes",
+        "entry_run_id",
+        "entry_probability_up",
+        "entry_fused_score",
+        "entry_regime",
+        "entry_intent_decision",
+        "entry_conformal_low",
+        "entry_conformal_high",
+        "entry_snapshot_json",
     ]
     prepared = positions.copy()
     for column in required_columns:
@@ -1315,9 +1434,17 @@ def save_real_positions(
                 cost_basis,
                 current_price,
                 last_updated_at,
-                notes
+                notes,
+                entry_run_id,
+                entry_probability_up,
+                entry_fused_score,
+                entry_regime,
+                entry_intent_decision,
+                entry_conformal_low,
+                entry_conformal_high,
+                entry_snapshot_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(position_id) DO UPDATE SET
                 ticker = excluded.ticker,
                 quantity = excluded.quantity,
@@ -1326,7 +1453,15 @@ def save_real_positions(
                 cost_basis = excluded.cost_basis,
                 current_price = COALESCE(excluded.current_price, real_positions.current_price),
                 last_updated_at = COALESCE(excluded.last_updated_at, real_positions.last_updated_at),
-                notes = excluded.notes
+                notes = excluded.notes,
+                entry_run_id = COALESCE(excluded.entry_run_id, real_positions.entry_run_id),
+                entry_probability_up = COALESCE(excluded.entry_probability_up, real_positions.entry_probability_up),
+                entry_fused_score = COALESCE(excluded.entry_fused_score, real_positions.entry_fused_score),
+                entry_regime = COALESCE(excluded.entry_regime, real_positions.entry_regime),
+                entry_intent_decision = COALESCE(excluded.entry_intent_decision, real_positions.entry_intent_decision),
+                entry_conformal_low = COALESCE(excluded.entry_conformal_low, real_positions.entry_conformal_low),
+                entry_conformal_high = COALESCE(excluded.entry_conformal_high, real_positions.entry_conformal_high),
+                entry_snapshot_json = COALESCE(excluded.entry_snapshot_json, real_positions.entry_snapshot_json)
             """,
             records,
         )
@@ -1390,7 +1525,7 @@ def update_real_position_prices(
     database_path: Path = DATABASE_PATH,
 ) -> int:
     with get_connection(database_path) as connection:
-        positions = pd.read_sql_query(
+        positions = _read_sql_query(connection,
             """
             SELECT position_id, ticker
             FROM real_positions
@@ -1443,7 +1578,7 @@ def get_real_positions(
         update_real_position_prices(prices=prices, database_path=database_path)
 
     with get_connection(database_path) as connection:
-        positions = pd.read_sql_query(
+        positions = _read_sql_query(connection,
             """
             SELECT *
             FROM real_positions
@@ -1528,7 +1663,7 @@ def save_risk_alerts(
 
 def get_risk_alerts(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM risk_alerts
@@ -1594,7 +1729,7 @@ def save_trade_outcome_run(
 
 def get_trade_outcome_runs(database_path: Path = DATABASE_PATH) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM trade_outcome_runs
@@ -1673,7 +1808,7 @@ def read_operational_trade_outcomes(
     database_path: Path = DATABASE_PATH,
 ) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM operational_trade_outcomes
@@ -1688,27 +1823,36 @@ def read_operational_trade_outcomes(
 def read_latest_operational_trade_outcomes(
     database_path: Path = DATABASE_PATH,
 ) -> pd.DataFrame:
-    """Return the most recent prediction per ticker across all runs."""
+    """Return the most recent operational trade-outcome run as one coherent set."""
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT t.*
             FROM operational_trade_outcomes AS t
             JOIN (
-                SELECT ticker, MAX(date) AS max_date
+                SELECT run_id
                 FROM operational_trade_outcomes
-                GROUP BY ticker
+                GROUP BY run_id
+                ORDER BY MAX(created_at) DESC, MAX(date) DESC, run_id DESC
+                LIMIT 1
+            ) AS latest_run
+              ON latest_run.run_id = t.run_id
+            JOIN (
+                SELECT run_id, MAX(date) AS max_date
+                FROM operational_trade_outcomes
+                GROUP BY run_id
             ) AS latest
-              ON latest.ticker = t.ticker AND latest.max_date = t.date
+              ON latest.run_id = t.run_id AND latest.max_date = t.date
             JOIN (
                 SELECT run_id, ticker, date, MAX(created_at) AS max_created
                 FROM operational_trade_outcomes
-                GROUP BY ticker, date
+                GROUP BY run_id, ticker, date
             ) AS most_recent
-              ON most_recent.ticker = t.ticker
+              ON most_recent.run_id = t.run_id
+             AND most_recent.ticker = t.ticker
              AND most_recent.date = t.date
              AND most_recent.max_created = t.created_at
-            ORDER BY t.ticker
+            ORDER BY t.run_id DESC, t.ticker
             """,
             connection,
         )
@@ -1718,7 +1862,7 @@ def get_operational_trade_outcomes(
     database_path: Path = DATABASE_PATH,
 ) -> pd.DataFrame:
     with get_connection(database_path) as connection:
-        return pd.read_sql_query(
+        return _read_sql_query(connection,
             """
             SELECT *
             FROM operational_trade_outcomes

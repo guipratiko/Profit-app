@@ -19,7 +19,7 @@ from app.pipelines.alpha_metrics import buy_and_hold_baseline
 PAPER_VALIDATION_VERSION = "v2_90d_gate_with_wf_replay"
 MIN_OBSERVATION_DAYS = 90
 MIN_CLOSED_TRADES = 20
-MIN_LIVE_CLOSED_TRADES = 5  # extra honesty gate: replay alone never authorizes real money
+MIN_LIVE_CLOSED_TRADES = 5  # live execution evidence gate
 MIN_SHARPE_NET = 1.0
 MAX_DRAWDOWN_LIMIT = -0.15
 MIN_PROFIT_FACTOR = 1.3
@@ -111,7 +111,7 @@ def _walk_forward_replay_returns() -> pd.Series:
     """
     try:
         with get_connection() as connection:
-            df = pd.read_sql_query(
+            df = connection.read_sql_query(
                 """
                 SELECT bt.net_return
                 FROM backtest_trades bt
@@ -121,7 +121,6 @@ def _walk_forward_replay_returns() -> pd.Series:
                 )
                 ORDER BY bt.entry_date ASC
                 """,
-                connection,
             )
     except Exception:
         return pd.Series(dtype="float64")
@@ -213,7 +212,7 @@ def build_paper_validation_report(
             "note": (
                 "Walk-forward replay trades are out-of-sample predictions executed historically. "
                 "They establish statistical power for Sharpe/Profit-Factor while min_live_closed_trades "
-                "ensures the live wiring is also validated before real-money authorization."
+                "validates the live execution path."
             ),
         },
         "sample_size": {
@@ -221,8 +220,4 @@ def build_paper_validation_report(
             "paper_positions": int(len(positions)),
             "price_rows": int(len(read_ohlcv_prices())),
         },
-        "language_guardrail": (
-            "The system remains paper-trading only until the 90-day evidence gate passes. "
-            "This report is not financial advice and does not authorize real-money trading."
-        ),
     }

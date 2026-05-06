@@ -248,6 +248,7 @@ def run_refresh_pipeline(
     max_staleness_days: int = 1,
     refit_window_days: int = 180,
     skip_price_update: bool = False,
+    force_refresh: bool = False,
 ) -> dict:
     """Detect staleness and re-execute the operational pipeline end-to-end."""
     initialize_database()
@@ -257,7 +258,7 @@ def run_refresh_pipeline(
         "refresh_pipeline_version": REFRESH_PIPELINE_VERSION,
         "staleness": staleness,
     }
-    if not skip_price_update:
+    if not skip_price_update and not force_refresh:
         lag_sessions = staleness.get("trading_days_behind")
         if lag_sessions is not None and lag_sessions <= max_staleness_days:
             actions["status"] = "fresh_no_action"
@@ -270,10 +271,14 @@ def run_refresh_pipeline(
 
     # Local import keeps yfinance optional when only running diagnostics.
     if not skip_price_update:
-        from app.data.market_data import update_all_prices
+        from app.data.market_data import update_all_prices, update_latest_quote_snapshots
 
-        updated_rows = update_all_prices(tickers=tickers_list)
+        if force_refresh:
+            updated_rows = update_all_prices(tickers=tickers_list, period="7d")
+        else:
+            updated_rows = update_all_prices(tickers=tickers_list)
         actions["updated_prices"] = updated_rows
+        actions["updated_live_quotes"] = update_latest_quote_snapshots(tickers=tickers_list)
 
     actions["technical_feature_rows"] = generate_technical_features()
 

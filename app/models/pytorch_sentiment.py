@@ -26,6 +26,7 @@ import json
 import math
 import os
 import re
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -46,14 +47,33 @@ except ImportError:  # Python 3.14 in the lightweight local venv may not have to
 # available. We keep this opt-in via env var to avoid downloading 400MB weights
 # during normal CLI usage / CI.
 _TRANSFORMER_PIPELINE = None
+_POLARITY_PIPELINE: object = None  # (tokenizer, model, id2label) when loaded
+_TORCH_DEVICE = None  # cached torch.device after first resolve
+_RANDOM_PROJECTION_MATRIX = None  # cached JL matrix (TRANSFORMER_DIM -> EMBEDDING_DIMENSION)
+_TEXT_EMBED_CACHE: "OrderedDict[str, list[float]]" = OrderedDict()
+_TEXT_EMBED_CACHE_MAX = 4096
+_TEXT_POLARITY_CACHE: "OrderedDict[str, float]" = OrderedDict()
+_TEXT_POLARITY_CACHE_MAX = 4096
 _TRANSFORMER_NAME = os.environ.get(
     "PROFIT_APP_SENTIMENT_MODEL",
     "neuralmind/bert-base-portuguese-cased",  # BERTimbau base; FinBERT-PT-BR also works
 )
 _USE_TRANSFORMER = os.environ.get("PROFIT_APP_USE_TRANSFORMER_SENTIMENT", "0") == "1"
+# Optional supervised polarity head. Defaults to a lightweight multilingual
+# sentiment classifier when enabled. Independent from the encoder so users can
+# pick (encoder=BERTimbau, polarity=tabularisai/multilingual-sentiment).
+_USE_TRANSFORMER_POLARITY = os.environ.get("PROFIT_APP_USE_TRANSFORMER_POLARITY", "0") == "1"
+_POLARITY_MODEL_NAME = os.environ.get(
+    "PROFIT_APP_SENTIMENT_POLARITY_MODEL",
+    "lxyuan/distilbert-base-multilingual-cased-sentiments-student",
+)
+_TRANSFORMER_BATCH_SIZE = int(os.environ.get("PROFIT_APP_SENTIMENT_BATCH_SIZE", "16"))
+_TRANSFORMER_FP16 = os.environ.get("PROFIT_APP_SENTIMENT_FP16", "1") == "1"
+# Blend weight when both transformer polarity and lexical polarity are available.
+_POLARITY_BLEND_TRANSFORMER = float(os.environ.get("PROFIT_APP_POLARITY_BLEND", "0.7"))
 
 
-SENTIMENT_MODEL_NAME = "pytorch_contextual_sentiment_v2"
+SENTIMENT_MODEL_NAME = "pytorch_contextual_sentiment_v3"
 EMBEDDING_DIMENSION = 16  # kept for backwards-compat with stored rows
 TRANSFORMER_EMBEDDING_DIMENSION = 768
 TOKEN_RE = re.compile(r"[a-zA-Z_]+")
@@ -200,6 +220,80 @@ def detect_event_tags(text: str) -> tuple[list[str], float]:
     return matched, severity_max
 
 
+def _resolve_torch_device():
+    """Pick the best available torch device once and cache it."""
+    global _TORCH_DEVICE
+    if _TORCH_DEVICE is not None:
+        return _TORCH_DEVICE
+    if torch is None:
+        return None
+    try:
+        if torch.cuda.is_available():
+            _TORCH_DEVICE = torch.device("cuda")
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():  # type: ignore[attr-defined]
+            _TORCH_DEVICE = torch.device("mps")
+        else:
+            _TORCH_DEVICE = torch.device("cpu")
+    except Exception:
+        _TORCH_DEVICE = torch.device("cpu")
+    return _TORCH_DEVICE
+
+
+def _maybe_half(model):
+    """Cast to FP16 only on CUDA (MPS half is finicky; CPU half is slower)."""
+    if torch is None or not _TRANSFORMER_FP16:
+        return model
+    device = _resolve_torch_device()
+    if device is not None and device.type == "cuda":
+        try:
+            return model.half()
+        except Exception:
+            return model
+    return model
+
+
+def _get_random_projection_matrix(out_dim: int = EMBEDDING_DIMENSION):
+    """Seeded Gaussian random projection (Johnson-Lindenstrauss) 768 -> out_dim.
+
+    Replaces the previous modular-hash sum, which destroyed most of the encoder
+    signal. Random projection with rows ~ N(0, 1/sqrt(out_dim)) preserves
+    pairwise cosine distances within a small distortion bound and stays
+    deterministic via a fixed seed.
+    """
+    global _RANDOM_PROJECTION_MATRIX
+    if _RANDOM_PROJECTION_MATRIX is not None:
+        return _RANDOM_PROJECTION_MATRIX
+    if torch is None:
+        return None
+    generator = torch.Generator().manual_seed(20260505)
+    matrix = torch.randn(
+        TRANSFORMER_EMBEDDING_DIMENSION,
+        out_dim,
+        generator=generator,
+        dtype=torch.float32,
+    ) / math.sqrt(out_dim)
+    _RANDOM_PROJECTION_MATRIX = matrix
+    return _RANDOM_PROJECTION_MATRIX
+
+
+def _cache_get(cache: "OrderedDict[str, object]", key: str):
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    return None
+
+
+def _cache_put(cache: "OrderedDict[str, object]", key: str, value, max_size: int) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_size:
+        cache.popitem(last=False)
+
+
+def _text_key(text: str) -> str:
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
+
+
 def _load_transformer_pipeline():
     """Lazy-load FinBERT-PT-BR / BERTimbau if explicitly enabled and torch present."""
     global _TRANSFORMER_PIPELINE
@@ -212,40 +306,178 @@ def _load_transformer_pipeline():
     except Exception:
         return None
     try:
+        device = _resolve_torch_device()
         tokenizer = AutoTokenizer.from_pretrained(_TRANSFORMER_NAME)
         model = AutoModel.from_pretrained(_TRANSFORMER_NAME)
         model.eval()
-        _TRANSFORMER_PIPELINE = (tokenizer, model)
+        if device is not None:
+            model = model.to(device)
+        model = _maybe_half(model)
+        _TRANSFORMER_PIPELINE = (tokenizer, model, device)
         return _TRANSFORMER_PIPELINE
     except Exception:
         return None
 
 
-def _transformer_embed(text: str, dimension: int = EMBEDDING_DIMENSION) -> list[float] | None:
-    """Mean-pooled [CLS]-aware transformer embedding, projected to `dimension`.
-
-    Projection is a deterministic hash-based linear map (no learned weights),
-    so we don't add a fine-tuning dependency just to obtain a stable signature.
-    """
-    pipeline = _load_transformer_pipeline()
-    if pipeline is None:
+def _load_polarity_pipeline():
+    """Lazy-load supervised polarity classifier when opted-in."""
+    global _POLARITY_PIPELINE
+    if _POLARITY_PIPELINE is not None:
+        return _POLARITY_PIPELINE
+    if not _USE_TRANSFORMER_POLARITY or torch is None:
         return None
-    tokenizer, model = pipeline
     try:
-        with torch.no_grad():
-            tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
-            out = model(**tokens).last_hidden_state.mean(dim=1).squeeze(0)
-            full = out.cpu().tolist()
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer  # type: ignore
     except Exception:
         return None
-    # Deterministic projection 768 → `dimension` so embedding column stays the same width.
-    projected = [0.0] * dimension
-    for index, value in enumerate(full):
-        projected[index % dimension] += float(value)
-    norm = math.sqrt(sum(v * v for v in projected))
-    if norm > 0:
-        projected = [v / norm for v in projected]
-    return projected
+    try:
+        device = _resolve_torch_device()
+        tokenizer = AutoTokenizer.from_pretrained(_POLARITY_MODEL_NAME)
+        model = AutoModelForSequenceClassification.from_pretrained(_POLARITY_MODEL_NAME)
+        model.eval()
+        if device is not None:
+            model = model.to(device)
+        model = _maybe_half(model)
+        id2label = getattr(model.config, "id2label", {}) or {}
+        _POLARITY_PIPELINE = (tokenizer, model, device, id2label)
+        return _POLARITY_PIPELINE
+    except Exception:
+        return None
+
+
+def _label_to_polarity(label: str) -> float:
+    label_norm = (label or "").strip().lower()
+    if label_norm in {"positive", "pos", "label_2", "5 stars", "4 stars"}:
+        return 1.0
+    if label_norm in {"negative", "neg", "label_0", "1 star", "2 stars"}:
+        return -1.0
+    return 0.0
+
+
+def _transformer_embed_batch(
+    texts: list[str], dimension: int = EMBEDDING_DIMENSION
+) -> dict[str, list[float]]:
+    """Encode a batch of texts at once and populate the cache. Returns key->embedding for new entries."""
+    pipeline = _load_transformer_pipeline()
+    if pipeline is None or not texts:
+        return {}
+    tokenizer, model, device = pipeline
+    projection = _get_random_projection_matrix(dimension)
+    if projection is None:
+        return {}
+    # Deduplicate by hash & skip cached.
+    pending: list[tuple[str, str]] = []  # (key, text)
+    seen_keys: set[str] = set()
+    for text in texts:
+        key = _text_key(text)
+        if key in seen_keys or key in _TEXT_EMBED_CACHE:
+            continue
+        seen_keys.add(key)
+        pending.append((key, text))
+    if not pending:
+        return {}
+    results: dict[str, list[float]] = {}
+    try:
+        with torch.inference_mode():
+            for start in range(0, len(pending), _TRANSFORMER_BATCH_SIZE):
+                chunk = pending[start : start + _TRANSFORMER_BATCH_SIZE]
+                chunk_texts = [t for _key, t in chunk]
+                tokens = tokenizer(
+                    chunk_texts,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=256,
+                    padding=True,
+                )
+                if device is not None:
+                    tokens = {k: v.to(device) for k, v in tokens.items()}
+                outputs = model(**tokens).last_hidden_state.mean(dim=1)  # (B, 768)
+                proj_device_matrix = projection.to(outputs.device, dtype=outputs.dtype)
+                projected = outputs @ proj_device_matrix  # (B, dim)
+                # L2 normalise per row.
+                norms = projected.norm(dim=1, keepdim=True).clamp(min=1e-12)
+                projected = projected / norms
+                projected_cpu = projected.float().cpu().tolist()
+                for (key, _text), row in zip(chunk, projected_cpu):
+                    embedding = [float(v) for v in row]
+                    _cache_put(_TEXT_EMBED_CACHE, key, embedding, _TEXT_EMBED_CACHE_MAX)
+                    results[key] = embedding
+    except Exception:
+        return results
+    return results
+
+
+def _transformer_polarity_batch(texts: list[str]) -> dict[str, float]:
+    """Score polarity in [-1, 1] for each text via the supervised classifier."""
+    pipeline = _load_polarity_pipeline()
+    if pipeline is None or not texts:
+        return {}
+    tokenizer, model, device, id2label = pipeline
+    pending: list[tuple[str, str]] = []
+    seen_keys: set[str] = set()
+    for text in texts:
+        key = _text_key(text)
+        if key in seen_keys or key in _TEXT_POLARITY_CACHE:
+            continue
+        seen_keys.add(key)
+        pending.append((key, text))
+    if not pending:
+        return {}
+    results: dict[str, float] = {}
+    try:
+        with torch.inference_mode():
+            for start in range(0, len(pending), _TRANSFORMER_BATCH_SIZE):
+                chunk = pending[start : start + _TRANSFORMER_BATCH_SIZE]
+                chunk_texts = [t for _key, t in chunk]
+                tokens = tokenizer(
+                    chunk_texts,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=256,
+                    padding=True,
+                )
+                if device is not None:
+                    tokens = {k: v.to(device) for k, v in tokens.items()}
+                logits = model(**tokens).logits.float()  # (B, num_labels)
+                probs = torch.softmax(logits, dim=-1).cpu().tolist()
+                for (key, _text), row in zip(chunk, probs):
+                    score = 0.0
+                    for idx, prob in enumerate(row):
+                        label = id2label.get(idx, str(idx))
+                        score += float(prob) * _label_to_polarity(label)
+                    score = max(-1.0, min(1.0, score))
+                    _cache_put(_TEXT_POLARITY_CACHE, key, score, _TEXT_POLARITY_CACHE_MAX)
+                    results[key] = score
+    except Exception:
+        return results
+    return results
+
+
+def _transformer_embed(text: str, dimension: int = EMBEDDING_DIMENSION) -> list[float] | None:
+    """Single-text embedding with cache + JL projection."""
+    if not _USE_TRANSFORMER or torch is None:
+        return None
+    key = _text_key(text)
+    cached = _cache_get(_TEXT_EMBED_CACHE, key)
+    if cached is not None:
+        return list(cached)  # type: ignore[arg-type]
+    _transformer_embed_batch([text], dimension=dimension)
+    cached = _cache_get(_TEXT_EMBED_CACHE, key)
+    if cached is None:
+        return None
+    return list(cached)  # type: ignore[arg-type]
+
+
+def _transformer_polarity(text: str) -> float | None:
+    if not _USE_TRANSFORMER_POLARITY or torch is None:
+        return None
+    key = _text_key(text)
+    cached = _cache_get(_TEXT_POLARITY_CACHE, key)
+    if cached is not None:
+        return float(cached)  # type: ignore[arg-type]
+    _transformer_polarity_batch([text])
+    cached = _cache_get(_TEXT_POLARITY_CACHE, key)
+    return float(cached) if cached is not None else None  # type: ignore[arg-type]
 
 
 def token_embedding(tokens: list[str], dimension: int = EMBEDDING_DIMENSION) -> list[float]:
@@ -282,21 +514,44 @@ def analyze_text(text: str) -> TextSentiment:
     negative_hits = sum(1 for token in tokens if token in NEGATIVE_TERMS)
     neutral_hits = sum(1 for token in tokens if token in {term.lower() for term in NEUTRAL_CONTEXT_TERMS})
     directional_hits = positive_hits + negative_hits
-    sentiment_score = (positive_hits - negative_hits) / max(directional_hits, 1)
-    positive_score = positive_hits / max(directional_hits + neutral_hits, 1)
-    negative_score = negative_hits / max(directional_hits + neutral_hits, 1)
+    lexical_polarity = (positive_hits - negative_hits) / max(directional_hits, 1)
+
+    transformer_polarity = _transformer_polarity(text)
+    if transformer_polarity is not None:
+        if directional_hits > 0:
+            blend = max(0.0, min(1.0, _POLARITY_BLEND_TRANSFORMER))
+            sentiment_score = blend * transformer_polarity + (1.0 - blend) * lexical_polarity
+        else:
+            sentiment_score = transformer_polarity
+    else:
+        sentiment_score = lexical_polarity
+
+    # Probabilistic-style soft scores derived from the final blended polarity.
+    pos_share = max(0.0, sentiment_score)
+    neg_share = max(0.0, -sentiment_score)
+    if (pos_share + neg_share) > 0:
+        positive_score = pos_share / (pos_share + neg_share + 1e-9)
+        negative_score = neg_share / (pos_share + neg_share + 1e-9)
+    else:
+        denom = max(directional_hits + neutral_hits, 1)
+        positive_score = positive_hits / denom
+        negative_score = negative_hits / denom
     neutral_score = 1.0 - min(1.0, positive_score + negative_score)
 
     event_tags, severity = detect_event_tags(text)
     event_magnitude = float(min(1.0, abs(sentiment_score) * (severity if severity > 0 else 0.0)))
 
     transformer_embedding = _transformer_embed(text)
+    encoder_parts: list[str] = []
     if transformer_embedding is not None:
         embedding = transformer_embedding
-        encoder = f"transformer:{_TRANSFORMER_NAME}"
+        encoder_parts.append(f"encoder:{_TRANSFORMER_NAME}")
     else:
         embedding = token_embedding(tokens)
-        encoder = "lexical_fallback"
+        encoder_parts.append("lexical_fallback")
+    if transformer_polarity is not None:
+        encoder_parts.append(f"polarity:{_POLARITY_MODEL_NAME}")
+    encoder = "+".join(encoder_parts)
 
     return TextSentiment(
         sentiment_score=float(sentiment_score),
@@ -375,11 +630,40 @@ def build_qualitative_features(events: pd.DataFrame | None = None) -> pd.DataFra
     if events.empty:
         return pd.DataFrame()
 
+    # Pre-warm transformer caches with one batched forward pass over the full
+    # corpus so per-group aggregation reuses cached embeddings/polarities.
+    if _USE_TRANSFORMER or _USE_TRANSFORMER_POLARITY:
+        all_texts = events["normalized_text"].fillna("").tolist()
+        if _USE_TRANSFORMER:
+            _transformer_embed_batch(all_texts)
+        if _USE_TRANSFORMER_POLARITY:
+            _transformer_polarity_batch(all_texts)
+
     records = [
         aggregate_event_group(group)
         for _key, group in events.groupby(["ticker", "aligned_trading_date"], sort=False)
     ]
-    return pd.DataFrame(records)
+    if not records:
+        return pd.DataFrame()
+    frame = pd.DataFrame(records)
+    # Cross-sectional calibration of event_magnitude_max into a percentile rank
+    # so fusion overrides reflect *relative* event strength within the batch,
+    # not a fixed absolute prior. Stored inside metadata_json to avoid schema churn.
+    if "metadata_json" in frame.columns and len(frame) > 1:
+        magnitudes = []
+        parsed: list[dict] = []
+        for blob in frame["metadata_json"].tolist():
+            try:
+                payload = json.loads(blob) if isinstance(blob, str) else dict(blob or {})
+            except Exception:
+                payload = {}
+            parsed.append(payload)
+            magnitudes.append(float(payload.get("event_magnitude_max", 0.0) or 0.0))
+        ranks = pd.Series(magnitudes).rank(method="average", pct=True).fillna(0.0).tolist()
+        for payload, rank in zip(parsed, ranks):
+            payload["event_magnitude_calibrated_pct"] = float(rank)
+        frame["metadata_json"] = [json.dumps(p, ensure_ascii=True) for p in parsed]
+    return frame
 
 
 def generate_qualitative_features() -> dict:

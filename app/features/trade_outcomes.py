@@ -30,6 +30,10 @@ BASE_FEATURE_COLUMNS = [
     "volume_ratio_21d",
     "drawdown_252d",
     "rsi_14",
+    "atr_pct_14",
+    "gap_pct",
+    "candle_body_pct",
+    "range_pct_21d",
 ]
 
 DERIVED_FEATURE_COLUMNS = [
@@ -85,7 +89,20 @@ def add_regime_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def calculate_stop_distance(volatility_21d: float) -> float:
+def calculate_stop_distance(
+    volatility_21d: float,
+    atr_pct_14: float | None = None,
+) -> float:
+    """Mirror the live paper-trading stop math as closely as possible.
+
+    The execution layer sizes positions off ``2 * ATR(14) / price``.  The
+    technical feature matrix already persists that ratio as ``atr_pct_14``, so
+    the trade-outcome model should learn on the same stop geometry instead of a
+    separate volatility heuristic.  When older rows lack ``atr_pct_14`` we fall
+    back to the legacy volatility-based proxy.
+    """
+    if atr_pct_14 is not None and np.isfinite(float(atr_pct_14)):
+        return float(np.clip(float(atr_pct_14) * 2.0, 1e-6, 0.5))
     return float(np.clip(float(volatility_21d) * 2.0, 0.03, 0.12))
 
 
@@ -161,7 +178,10 @@ def build_trade_outcome_dataset(
             if idx is None:
                 continue
             entry_close = float(closes[idx])
-            stop_distance = calculate_stop_distance(feature_row["volatility_21d"])
+            stop_distance = calculate_stop_distance(
+                feature_row["volatility_21d"],
+                feature_row.get("atr_pct_14"),
+            )
             target_distance = stop_distance * float(min_reward_risk)
             future_slice: list[dict] = []
             stop_at = min(idx + 1 + holding_days, len(closes))
@@ -214,9 +234,10 @@ def build_current_trade_outcome_features() -> pd.DataFrame:
     """Latest feature row per ticker, ready for trade-outcome inference.
 
     Uses the price-derived features fed into the supervised dataset, which
-    guarantees the same engineering as training.  The latest row is the most
+    guarantees the same engineering as training. The latest row is the most
     recent trading session for which technical indicators (252d window etc.) are
-    fully defined.
+    fully defined, including ``atr_pct_14`` used to keep the trade-outcome stop
+    aligned with the live paper-trading ATR stop.
     """
     from app.features.technical import build_current_technical_features
 

@@ -1,15 +1,36 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: profit-app-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: profit_app
+      POSTGRES_PASSWORD: profit_app_local
+      POSTGRES_DB: profit_app
+    volumes:
+      - profit_app_pgdata:/var/lib/postgresql/data
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U profit_app -d profit_app"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   backend:
     build:
       context: .
     container_name: profit-app-backend
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8021:8000"
     environment:
       PORT: "8000"
       PROFIT_APP_STORAGE_DIR: /data
-      PROFIT_APP_DATABASE_PATH: /data/profit_app.sqlite3
+      DATABASE_URL: postgresql+psycopg://profit_app:profit_app_local@postgres:5432/profit_app
     volumes:
       - ./storage:/data
     healthcheck:
@@ -22,3 +43,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+volumes:
+  profit_app_pgdata:

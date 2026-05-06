@@ -10,6 +10,7 @@ import {
   Filter,
   Plus,
   RefreshCw,
+  Search,
   Save,
   ShieldCheck,
   Trash2,
@@ -29,7 +30,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PriceChart } from "@/components/price-chart";
 import { GateChart } from "@/components/gate-chart";
 
-type Horizon = "7d" | "3m" | "5y";
+type Horizon = "7d" | "3m" | "1y";
 type DashboardTab = "trending" | "predictions" | "investments";
 type IntentFilter = "ALL" | "BUY" | "SELL" | "NO_OPERATE";
 type Thesis = Record<string, any>;
@@ -146,7 +147,7 @@ type RefreshJob = {
   result?: Record<string, unknown> | null;
 };
 
-const horizonLimits: Record<Horizon, number> = { "7d": 7, "3m": 90, "5y": 1260 };
+const horizonLimits: Record<Horizon, number> = { "7d": 7, "3m": 90, "1y": 252 };
 
 function toLocalDateTimeInputValue(date = new Date()) {
   const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
@@ -306,6 +307,39 @@ function finiteCount(value: unknown) {
   return Number.isFinite(count) ? count : null;
 }
 
+function normalizeSearchText(value?: string | null) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function assetMatchesQuery(asset: Pick<Asset, "ticker" | "name"> | null | undefined, query: string) {
+  if (!asset) return false;
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedQuery) return true;
+  const haystack = `${asset.ticker} ${asset.name}`;
+  return normalizeSearchText(haystack).includes(normalizedQuery);
+}
+
+function modelWindowLabel(targetName?: string | null) {
+  const rawWindow = String(targetName || "").match(/(\d+[dmy])$/i)?.[1]?.toLowerCase();
+  if (!rawWindow) return "7d";
+  const days = HORIZON_TO_DAYS[rawWindow];
+  if (days === 63) return "3m";
+  if (days === 252) return "1y";
+  return rawWindow;
+}
+
+function modelDirectionLabel(direction?: string | null) {
+  const normalized = String(direction || "").toUpperCase();
+  if (normalized === "UP") return "Alta";
+  if (normalized === "DOWN") return "Baixa";
+  if (normalized === "SIDEWAYS") return "Lateral";
+  return direction || "-";
+}
+
 function positionState(position?: Position, signal?: PaperSignal | null): { label: string; tone: Tone } {
   if (position?.status === "open") return { label: "Em carteira", tone: "good" };
   if (position?.status?.startsWith("closed")) return { label: "Posicao anterior encerrada", tone: "neutral" };
@@ -402,7 +436,9 @@ export default function Page() {
   const [busyRealRefresh, setBusyRealRefresh] = useState(false);
   const [busyRealDeleteId, setBusyRealDeleteId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [assetSearch, setAssetSearch] = useState("");
   const [realForm, setRealForm] = useState<RealPositionFormState>(() => createEmptyRealForm());
+  const [realFormAssetSearch, setRealFormAssetSearch] = useState("");
   const [realPortfolioModalOpen, setRealPortfolioModalOpen] = useState(false);
   const [realDrafts, setRealDrafts] = useState<Record<string, RealPositionFormState>>({});
 
@@ -412,6 +448,7 @@ export default function Page() {
 
   function openRealPositionModal(position?: RealPosition) {
     setError(null);
+    setRealFormAssetSearch("");
     if (position) {
       setSelectedTicker(position.ticker);
       setRealForm(createRealFormFromPosition(position));
@@ -423,6 +460,7 @@ export default function Page() {
 
   function closeRealPositionModal() {
     if (busyRealSave) return;
+    setRealFormAssetSearch("");
     setRealPortfolioModalOpen(false);
     resetRealForm(selectedTicker || realForm.ticker || state.assets[0]?.ticker || "");
   }
@@ -486,9 +524,15 @@ export default function Page() {
     setBusyRefresh(true);
     setError(null);
     try {
-      await api.refreshRun({ maxStalenessDays: 0, refitWindowDays: 180, asyncMode: true });
+      await api.refreshRun({
+        maxStalenessDays: 0,
+        refitWindowDays: 180,
+        asyncMode: true,
+        forceRefresh: true,
+      });
 
-      for (let attempt = 0; attempt < 80; attempt += 1) {
+      let refreshCompleted = false;
+      for (let attempt = 0; attempt < 180; attempt += 1) {
         const refresh = await api.refreshStatus();
         setState((current) => ({ ...current, refresh }));
         const job = readRefreshJob(refresh);
@@ -498,12 +542,17 @@ export default function Page() {
           throw new Error(job.error || "Falha ao sincronizar mercado");
         }
         if ((job?.status === "completed" || job?.status === "idle" || !job?.status) && !isStale) {
+          refreshCompleted = true;
           break;
         }
 
         await sleep(3000);
       }
+      if (!refreshCompleted) {
+        throw new Error("A sincronizacao completa ainda esta em andamento. Tente novamente em instantes.");
+      }
 
+      await api.markToMarket({ refreshPrices: true, refreshPeriod: "7d" });
       await loadDashboard(selectedTicker);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Falha ao atualizar mercado");
@@ -541,6 +590,7 @@ export default function Page() {
 
   const selectedPrediction = selectedTicker ? state.predictions[selectedTicker] : undefined;
   const selectedSignal = selectedPrediction?.paper_signal || signalForTicker(state.signals, selectedTicker);
+  const selectedTechnical = selectedPrediction?.technical_prediction;
   const selectedThesis = thesisFor(selectedSignal);
   const gateStatus = String(state.gate?.status || "unknown");
   const paperSignals = state.alpha?.paper_signals || {};
@@ -548,6 +598,10 @@ export default function Page() {
   const assetByTicker = useMemo(
     () => Object.fromEntries(state.assets.map((asset) => [asset.ticker, asset] as const)),
     [state.assets]
+  );
+  const filteredAssets = useMemo(
+    () => state.assets.filter((asset) => assetMatchesQuery(asset, assetSearch)),
+    [state.assets, assetSearch]
   );
 
   const investmentRows = useMemo<PortfolioIntent[]>(() => {
@@ -597,11 +651,20 @@ export default function Page() {
     });
   }, [state.assets, state.predictions, state.signals, state.positions, state.alerts]);
 
-  const selectedInvestment = investmentRows.find((row) => row.ticker === selectedTicker) || investmentRows[0];
+  const searchedInvestmentRows = useMemo(
+    () => investmentRows.filter((row) => assetMatchesQuery(row.asset, assetSearch)),
+    [investmentRows, assetSearch]
+  );
   const filteredInvestmentRows = useMemo(() => {
-    if (investmentIntentFilter === "ALL") return investmentRows;
-    return investmentRows.filter((row) => classifyIntentLabel(row.intentLabel) === investmentIntentFilter);
-  }, [investmentRows, investmentIntentFilter]);
+    if (investmentIntentFilter === "ALL") return searchedInvestmentRows;
+    return searchedInvestmentRows.filter((row) => classifyIntentLabel(row.intentLabel) === investmentIntentFilter);
+  }, [searchedInvestmentRows, investmentIntentFilter]);
+  const selectedInvestment = filteredInvestmentRows.find((row) => row.ticker === selectedTicker)
+    || searchedInvestmentRows.find((row) => row.ticker === selectedTicker)
+    || investmentRows.find((row) => row.ticker === selectedTicker)
+    || filteredInvestmentRows[0]
+    || searchedInvestmentRows[0]
+    || investmentRows[0];
   const investmentFilterCounts = useMemo(() => {
     return INTENT_FILTERS.reduce<Record<IntentFilter, number>>((counts, filter) => {
       counts[filter.value] = filter.value === "ALL"
@@ -610,7 +673,7 @@ export default function Page() {
       return counts;
     }, { ALL: 0, BUY: 0, SELL: 0, NO_OPERATE: 0 });
   }, [investmentRows]);
-  const selectedAsset = selectedInvestment?.asset || assetByTicker[selectedTicker] || state.assets[0] || null;
+  const selectedAsset = selectedInvestment?.asset || assetByTicker[selectedTicker] || filteredAssets[0] || state.assets[0] || null;
   const openInvestmentCount = investmentRows.filter((row) => row.position?.status === "open").length;
   const realPortfolioRows = useMemo<RealPortfolioRow[]>(() => {
     return state.realPositions.map((position) => {
@@ -631,9 +694,10 @@ export default function Page() {
     });
   }, [investmentRows, state.assets, state.realPositions]);
   const filteredRealPortfolioRows = useMemo(() => {
-    if (investmentIntentFilter === "ALL") return realPortfolioRows;
-    return realPortfolioRows.filter((row) => classifyIntentLabel(row.intentLabel) === investmentIntentFilter);
-  }, [realPortfolioRows, investmentIntentFilter]);
+    const searchedRows = realPortfolioRows.filter((row) => assetMatchesQuery({ ticker: row.position.ticker, name: row.assetName }, assetSearch));
+    if (investmentIntentFilter === "ALL") return searchedRows;
+    return searchedRows.filter((row) => classifyIntentLabel(row.intentLabel) === investmentIntentFilter);
+  }, [realPortfolioRows, investmentIntentFilter, assetSearch]);
   const realPortfolioSummary = useMemo(() => {
     const invested = state.realPositions.reduce((sum, position) => sum + Number(position.cost_basis || 0), 0);
     const marketValue = state.realPositions.reduce((sum, position) => sum + Number(position.market_value || 0), 0);
@@ -646,6 +710,49 @@ export default function Page() {
       unrealizedReturn: invested > 0 ? marketValue / invested - 1.0 : null
     };
   }, [state.realPositions]);
+  const traderCockpit = useMemo(() => {
+    const intentByTicker = new Map(investmentRows.map((row) => [row.ticker, row] as const));
+    let openRiskBrl = 0;
+    const divergentPositions: Array<{ ticker: string; intentLabel: string; intentTone: Tone; pnl: number }> = [];
+    state.realPositions.forEach((position) => {
+      const intent = intentByTicker.get(position.ticker);
+      const atrPct = Number(intent?.thesis?.sizing?.atr_14);
+      const referencePrice = Number(position.current_price || position.entry_price || 0);
+      if (Number.isFinite(atrPct) && atrPct > 0 && referencePrice > 0) {
+        // Risk in BRL = position notional × 1 ATR move (one-sigma move proxy).
+        openRiskBrl += Math.abs(Number(position.quantity || 0)) * referencePrice * atrPct;
+      }
+      const intentClass = classifyIntentLabel(intent?.intentLabel || "");
+      // Divergence: model now wants out / NO_OPERATE on a position we still hold.
+      if (intent && (intentClass === "SELL" || intentClass === "NO_OPERATE")) {
+        divergentPositions.push({
+          ticker: position.ticker,
+          intentLabel: intent.intentLabel,
+          intentTone: intent.intentTone,
+          pnl: Number(position.unrealized_pnl || 0),
+        });
+      }
+    });
+    const drawdownPeak = Number(state.gate?.metrics?.max_drawdown ?? NaN);
+    const gateLabel = gateStatus === "approved"
+      ? "Aprovado"
+      : gateStatus === "blocked"
+        ? "Bloqueado"
+        : gateStatus === "pending"
+          ? "Pendente"
+          : gateStatus.replaceAll("_", " ");
+    const gateTone: Tone = gateStatus === "approved" ? "good" : gateStatus === "blocked" ? "bad" : "warn";
+    return {
+      openPnl: realPortfolioSummary.unrealizedPnl,
+      openPnlReturn: realPortfolioSummary.unrealizedReturn,
+      exposure: realPortfolioSummary.marketValue,
+      openRisk: openRiskBrl,
+      drawdown: Number.isFinite(drawdownPeak) ? drawdownPeak : null,
+      gateLabel,
+      gateTone,
+      divergentPositions,
+    };
+  }, [investmentRows, state.realPositions, state.gate, gateStatus, realPortfolioSummary]);
   const opportunityRows = useMemo(() => {
     const ranked = [...investmentRows].sort((left, right) => {
       const leftIntentBoost = classifyIntentLabel(left.intentLabel) === "BUY" ? 1 : 0;
@@ -683,20 +790,35 @@ export default function Page() {
       gateLabel: gateStatus.replaceAll("_", " ")
     };
   }, [investmentRows, paperSignals, state.realPositions, gateStatus]);
-  const movingPortfolioText = useMemo(() => {
+  const movingPortfolioItems = useMemo(() => {
     const topInvestedText = topInvestedRows.length
-      ? topInvestedRows.map((position) => `${position.ticker} ${fmtMoney(position.cost_basis)}`).join("  •  ")
-      : "sem entradas cadastradas";
+      ? topInvestedRows.map((position) => `${position.ticker} ${fmtMoney(position.cost_basis)}`).join(" / ")
+      : "Sem entradas";
     const gains = state.realPositions
       .filter((position) => Number(position.unrealized_pnl || 0) > 0)
       .reduce((sum, position) => sum + Number(position.unrealized_pnl || 0), 0);
     const losses = state.realPositions
       .filter((position) => Number(position.unrealized_pnl || 0) < 0)
       .reduce((sum, position) => sum + Number(position.unrealized_pnl || 0), 0);
-    return `Entradas totais ${fmtMoney(realPortfolioSummary.invested)}  •  Lucros abertos ${fmtMoney(gains)}  •  Perdas abertas ${fmtMoney(losses)}  •  Maiores alocacoes ${topInvestedText}  •  Valor a mercado ${fmtMoney(realPortfolioSummary.marketValue)}  •  Retorno agregado ${fmtPercent(realPortfolioSummary.unrealizedReturn, 2)}`;
+    return [
+      { label: "Entradas", value: fmtMoney(realPortfolioSummary.invested) },
+      { label: "Lucros", value: fmtMoney(gains), tone: "text-emerald-300" },
+      { label: "Perdas", value: fmtMoney(losses), tone: "text-rose-300" },
+      { label: "Maiores", value: topInvestedText },
+      { label: "Mercado", value: fmtMoney(realPortfolioSummary.marketValue) },
+      { label: "Retorno", value: fmtPercent(realPortfolioSummary.unrealizedReturn, 2) },
+    ];
   }, [realPortfolioSummary, state.realPositions, topInvestedRows]);
   const isEditingRealPosition = Boolean(realForm.positionId);
   const selectedRealFormAsset = assetByTicker[realForm.ticker] || null;
+  const realFormAssetOptions = useMemo(() => {
+    const matches = state.assets.filter((asset) => assetMatchesQuery(asset, realFormAssetSearch));
+    if (!realForm.ticker || matches.some((asset) => asset.ticker === realForm.ticker)) {
+      return matches;
+    }
+    const selectedAssetOption = state.assets.find((asset) => asset.ticker === realForm.ticker);
+    return selectedAssetOption ? [selectedAssetOption, ...matches] : matches;
+  }, [state.assets, realForm.ticker, realFormAssetSearch]);
 
   async function auditConselheiro() {
     setBusyAudit(true);
@@ -896,11 +1018,15 @@ export default function Page() {
               </div>
               <Badge tone={realPortfolioSummary.unrealizedPnl >= 0 ? "good" : "bad"}>{marketPanelStats.realCount} entradas</Badge>
             </div>
-            <div className="mt-5 overflow-hidden border-y border-white/10 py-3">
-              <div className="ticker-marquee whitespace-nowrap text-sm font-medium text-sky-50/90">
-                <span>{movingPortfolioText}</span>
-                <span aria-hidden="true">{movingPortfolioText}</span>
-              </div>
+            <div className="mt-5 grid gap-2 border-y border-white/10 py-3 sm:grid-cols-2 xl:grid-cols-3">
+              {movingPortfolioItems.map((item) => (
+                <div key={item.label} className="min-w-0 rounded-lg border border-white/10 bg-white/[0.025] px-3 py-2">
+                  <div className="text-[10px] font-semibold uppercase tracking-wider text-sky-100/60">{item.label}</div>
+                  <div className={cn("mt-1 truncate text-sm font-semibold text-sky-50", item.tone)} title={item.value}>
+                    {item.value}
+                  </div>
+                </div>
+              ))}
             </div>
             <div className="mt-4 grid grid-cols-3 gap-2 text-xs">
               <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="text-muted-foreground">Investido</div><div className="mt-1 font-semibold">{fmtMoney(realPortfolioSummary.invested)}</div></div>
@@ -933,13 +1059,30 @@ export default function Page() {
             <TabsTrigger value="investments"><WalletCards className="h-4 w-4" /> Meus Investimentos</TabsTrigger>
           </TabsList>
 
+          <div className="mt-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <div className="relative w-full max-w-xl">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <input
+                type="search"
+                value={assetSearch}
+                onChange={(event) => setAssetSearch(event.target.value)}
+                placeholder="Pesquisar empresa ou ticker"
+                className="h-11 w-full rounded-2xl border border-white/10 bg-white/5 pl-10 pr-4 text-sm text-foreground outline-none transition-colors focus:border-sky-400/50"
+              />
+            </div>
+            <div className="text-xs text-muted-foreground">
+              {filteredAssets.length} de {state.assets.length} ativos visiveis
+            </div>
+          </div>
+
           <TabsContent value="trending">
             <section className="grid gap-4 xl:grid-cols-[1.4fr_0.8fr]">
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                {state.assets.map((asset) => {
+                {filteredAssets.map((asset) => {
                   const prediction = state.predictions[asset.ticker];
                   const paper = prediction?.paper_signal;
                   const fusion = prediction?.fusion_prediction;
+                  const technical = prediction?.technical_prediction;
                   const active = selectedTicker === asset.ticker;
                   return (
                     <button key={asset.ticker} onClick={() => setSelectedTicker(asset.ticker)} className={cn("glass glass-hover rounded-2xl p-5 text-left", active && "ring-glow border-sky-400/40")}>
@@ -951,15 +1094,15 @@ export default function Page() {
                             <div className="mt-1 line-clamp-1 text-xs text-muted-foreground">{asset.name}</div>
                           </div>
                         </div>
-                        <Badge tone={badgeTone(fusion?.fused_direction)}>{fusion?.fused_direction || "-"}</Badge>
+                        <Badge tone={badgeTone(fusion?.fused_direction || technical?.predicted_direction)}>{fusion?.fused_direction || modelDirectionLabel(technical?.predicted_direction)}</Badge>
                       </div>
                       <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
                         <div><div className="text-[10px] uppercase tracking-wider text-muted-foreground">Preco</div><div className="font-semibold text-foreground">{fmtMoney(paper?.reference_price)}</div></div>
-                        <div><div className="text-[10px] uppercase tracking-wider text-muted-foreground">Score</div><div className="font-semibold text-foreground">{fmtPercent(fusion?.fused_score, 1)}</div></div>
+                        <div><div className="text-[10px] uppercase tracking-wider text-muted-foreground">Prob. alta</div><div className="font-semibold text-foreground">{fmtPercent(technical?.probability_up ?? fusion?.fused_score, 1)}</div></div>
                       </div>
                       <div className="mt-4 flex items-center justify-between gap-2">
                         <Badge tone={badgeTone(paper?.operational_action || paper?.decision)}>{actionLabel(paper?.operational_action || paper?.decision)}</Badge>
-                        <span className="text-[11px] text-muted-foreground">{paper?.signal_date || "-"}</span>
+                        <span className="text-[11px] text-muted-foreground">{modelWindowLabel(technical?.target_name)} · {paper?.signal_date || technical?.date || "-"}</span>
                       </div>
                     </button>
                   );
@@ -978,13 +1121,30 @@ export default function Page() {
                       </div>
                     </div>
                     <div className="flex self-start rounded-xl border border-white/10 bg-white/5 p-1 backdrop-blur sm:self-auto">
-                      {(["7d", "3m", "5y"] as Horizon[]).map((value) => (
+                      {(["7d", "3m", "1y"] as Horizon[]).map((value) => (
                         <Button key={value} size="sm" variant={horizon === value ? "default" : "quiet"} onClick={() => setHorizon(value)}>{value}</Button>
                       ))}
                     </div>
                   </CardHeader>
                   <CardContent className="space-y-4">
                     <PriceChart rows={state.prices} />
+                    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4 text-sm backdrop-blur">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <div className="text-xs uppercase tracking-wider text-muted-foreground">Modelo tecnico atual</div>
+                          <div className="mt-1 font-medium text-foreground">Run operacional {selectedPrediction?.model_run_id || "-"}</div>
+                        </div>
+                        <Badge tone={modelWindowLabel(selectedTechnical?.target_name) === horizon ? "good" : "warn"}>
+                          {modelWindowLabel(selectedTechnical?.target_name) === horizon ? "Janela treinada ativa" : `Sem modelo treinado em ${horizon}`}
+                        </Badge>
+                      </div>
+                      <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-4">
+                        <div><div className="text-xs text-muted-foreground">Janela treinada</div><div className="font-semibold">{modelWindowLabel(selectedTechnical?.target_name)}</div></div>
+                        <div><div className="text-xs text-muted-foreground">Direcao</div><div className="font-semibold">{modelDirectionLabel(selectedTechnical?.predicted_direction)}</div></div>
+                        <div><div className="text-xs text-muted-foreground">Prob. alta</div><div className="font-semibold">{fmtPercent(selectedTechnical?.probability_up, 1)}</div></div>
+                        <div><div className="text-xs text-muted-foreground">Retorno esperado</div><div className="font-semibold">{fmtPercent(selectedTechnical?.expected_return, 2)}</div></div>
+                      </div>
+                    </div>
                     {selectedAsset && (
                       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm backdrop-blur">
                         <div>
@@ -1035,9 +1195,10 @@ export default function Page() {
           <TabsContent value="predictions">
             <section className="grid gap-4 lg:grid-cols-[1fr_360px]">
               <div className="grid gap-3 xl:grid-cols-2">
-                {state.assets.map((asset) => {
+                {filteredAssets.map((asset) => {
                   const prediction = state.predictions[asset.ticker];
                   const signal = prediction?.paper_signal;
+                  const technical = prediction?.technical_prediction;
                   const thesis = thesisFor(signal);
                   const regime = thesis?.regime_gate || parseJson<Record<string, any>>(prediction?.fusion_prediction?.explanation_json || null)?.regime || {};
                   return (
@@ -1058,6 +1219,12 @@ export default function Page() {
                           <div><div className="text-xs text-muted-foreground">Stop</div><div className="font-semibold">{fmtMoney(signal?.stop_loss)}</div></div>
                           <div><div className="text-xs text-muted-foreground">Alvo</div><div className="font-semibold">{fmtMoney(signal?.target_price)}</div></div>
                           <div><div className="text-xs text-muted-foreground">Qtd</div><div className="font-semibold">{signal?.max_shares ?? "-"}</div></div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
+                          <div><div className="text-xs text-muted-foreground">Modelo</div><div className="font-semibold">{modelWindowLabel(technical?.target_name)}</div></div>
+                          <div><div className="text-xs text-muted-foreground">Direcao tecnica</div><div className="font-semibold">{modelDirectionLabel(technical?.predicted_direction)}</div></div>
+                          <div><div className="text-xs text-muted-foreground">Prob. alta</div><div className="font-semibold">{fmtPercent(technical?.probability_up, 1)}</div></div>
+                          <div><div className="text-xs text-muted-foreground">Retorno esp.</div><div className="font-semibold">{fmtPercent(technical?.expected_return, 2)}</div></div>
                         </div>
                         <div className="flex flex-wrap gap-2">
                           <Badge tone={badgeTone(regime.regime)}>{regime.regime || "regime"}</Badge>
@@ -1102,6 +1269,72 @@ export default function Page() {
 
           <TabsContent value="investments">
             <div className="flex flex-col gap-4">
+              <Card>
+                <CardHeader>
+                  <div>
+                    <CardTitle>Cockpit do trader</CardTitle>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      Visão sempre visível: P/L em aberto, exposição, risco em ATR, drawdown desde pico e situação do gate v2 hoje.
+                    </div>
+                  </div>
+                  <Badge tone={traderCockpit.gateTone}>Gate hoje: {traderCockpit.gateLabel}</Badge>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  <div className="grid grid-cols-2 gap-3 text-sm md:grid-cols-5">
+                    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                      <div className="text-xs text-muted-foreground">P/L em aberto</div>
+                      <div className={cn("mt-1 text-lg font-semibold", traderCockpit.openPnl >= 0 ? "text-emerald-300" : "text-rose-300")}>
+                        {fmtMoney(traderCockpit.openPnl)}
+                      </div>
+                      <div className="text-xs text-muted-foreground">{fmtPercent(traderCockpit.openPnlReturn, 2)}</div>
+                    </div>
+                    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                      <div className="text-xs text-muted-foreground">Exposição total</div>
+                      <div className="mt-1 text-lg font-semibold text-foreground">{fmtMoney(traderCockpit.exposure)}</div>
+                      <div className="text-xs text-muted-foreground">{realPortfolioSummary.count} posições abertas</div>
+                    </div>
+                    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                      <div className="text-xs text-muted-foreground">Risco em aberto (Σ |Δ| × ATR)</div>
+                      <div className="mt-1 text-lg font-semibold text-foreground">{fmtMoney(traderCockpit.openRisk)}</div>
+                      <div className="text-xs text-muted-foreground">Σ qty × preço × ATR%</div>
+                    </div>
+                    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                      <div className="text-xs text-muted-foreground">Drawdown desde pico</div>
+                      <div className={cn("mt-1 text-lg font-semibold", (traderCockpit.drawdown ?? 0) <= -0.05 ? "text-rose-300" : "text-foreground")}>
+                        {traderCockpit.drawdown === null ? "—" : fmtPercent(traderCockpit.drawdown, 1)}
+                      </div>
+                      <div className="text-xs text-muted-foreground">{state.gate?.metrics?.closed_trades ?? 0} trades fechados</div>
+                    </div>
+                    <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                      <div className="text-xs text-muted-foreground">Gate v2 permite operar?</div>
+                      <div className="mt-1 flex items-center gap-2">
+                        <Badge tone={traderCockpit.gateTone}>{traderCockpit.gateTone === "good" ? "SIM" : "NÃO"}</Badge>
+                        <span className="text-xs text-muted-foreground">{traderCockpit.gateLabel}</span>
+                      </div>
+                      <div className="text-xs text-muted-foreground">Sharpe {fmtNumber(state.gate?.metrics?.sharpe_net, 2)} · PF {fmtNumber(state.gate?.metrics?.profit_factor, 2)}</div>
+                    </div>
+                  </div>
+                  {traderCockpit.divergentPositions.length > 0 && (
+                    <div className="rounded-xl border border-amber-400/30 bg-amber-400/10 p-3">
+                      <div className="flex items-center gap-2 text-xs uppercase tracking-wider text-amber-200">
+                        <ShieldCheck className="h-3.5 w-3.5" /> Divergência modelo × posição
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                        {traderCockpit.divergentPositions.map((entry) => (
+                          <span key={entry.ticker} className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.05] px-2 py-1">
+                            <span className="font-medium text-foreground">{entry.ticker}</span>
+                            <Badge tone={entry.intentTone} className="text-[10px]">{entry.intentLabel}</Badge>
+                            <span className={cn(entry.pnl >= 0 ? "text-emerald-300" : "text-rose-300")}>{fmtMoney(entry.pnl)}</span>
+                          </span>
+                        ))}
+                      </div>
+                      <div className="mt-2 text-[11px] text-muted-foreground">
+                        Modelo recomenda sair ou não operar nesses tickers que ainda estão em carteira. Reavalie a tese antes do próximo pregão.
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
               <section className="grid items-start gap-4 lg:grid-cols-[minmax(0,1.2fr)_360px]">
                 <Card>
                   <CardHeader>
@@ -1138,7 +1371,7 @@ export default function Page() {
                   <CardContent className="p-0">
                     {filteredInvestmentRows.length === 0 && <div className="p-6 text-sm text-muted-foreground">Nenhum ativo neste filtro.</div>}
                     {filteredInvestmentRows.length > 0 && (
-                      <div className="space-y-3 p-4 lg:hidden">
+                      <div className="grid gap-3 p-4 xl:grid-cols-2">
                         {filteredInvestmentRows.map((row) => (
                           <button
                             key={row.ticker}
@@ -1159,9 +1392,12 @@ export default function Page() {
                               </div>
                               <Badge tone={row.intentTone}>{row.intentLabel}</Badge>
                             </div>
-                            <div className="mt-3 flex flex-wrap items-center gap-2">
-                              <Badge tone={row.statusTone}>{row.statusLabel}</Badge>
-                              <span className="text-xs text-muted-foreground">{row.reviewLabel}</span>
+                            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Badge tone={row.statusTone}>{row.statusLabel}</Badge>
+                                <span className="text-xs text-muted-foreground">{row.reviewLabel}</span>
+                              </div>
+                              <span className="text-xs text-muted-foreground">{row.timeLabel}</span>
                             </div>
                             <div className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
                               <div>
@@ -1169,13 +1405,13 @@ export default function Page() {
                                 <div className="mt-1 font-medium text-foreground">{row.whenLabel}</div>
                               </div>
                               <div>
-                                <div className="text-xs text-muted-foreground">Horario</div>
-                                <div className="mt-1 font-medium text-foreground">{row.timeLabel}</div>
+                                <div className="text-xs text-muted-foreground">Atual</div>
+                                <div className="mt-1 font-medium text-foreground">{fmtMoney(row.currentPrice)}</div>
                               </div>
                             </div>
                             <div className="mt-3 rounded-xl border border-white/10 bg-white/[0.03] p-3">
                               <div className="text-xs uppercase tracking-wider text-muted-foreground">Motivo</div>
-                              <div className="mt-2 text-sm leading-6 text-foreground">{row.reasonLabel}</div>
+                              <div className="mt-2 line-clamp-3 text-sm leading-6 text-foreground">{row.reasonLabel}</div>
                             </div>
                             <div className="mt-3 grid grid-cols-3 gap-2 text-xs text-muted-foreground">
                               <div className="rounded-xl border border-white/10 bg-white/[0.03] p-2">
@@ -1195,60 +1431,6 @@ export default function Page() {
                         ))}
                       </div>
                     )}
-                    <div className="hidden overflow-x-auto scrollbar-thin lg:block">
-                    <table className="w-full min-w-[1180px] border-collapse text-sm">
-                      <thead className="bg-white/[0.04] text-[11px] uppercase tracking-wider text-muted-foreground">
-                        <tr>
-                          <th className="w-[220px] px-4 py-3 text-left font-medium">Ativo</th>
-                          <th className="w-[170px] px-4 py-3 text-left font-medium">Estado</th>
-                          <th className="w-[150px] px-4 py-3 text-left font-medium">Intencao</th>
-                          <th className="w-[220px] px-4 py-3 text-left font-medium">Quando</th>
-                          <th className="w-[170px] px-4 py-3 text-left font-medium">Horario</th>
-                          <th className="w-[340px] px-4 py-3 text-left font-medium">Motivo</th>
-                          <th className="w-[170px] px-4 py-3 text-left font-medium">Niveis</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {filteredInvestmentRows.map((row) => {
-                          return (
-                            <tr
-                              key={row.ticker}
-                              onClick={() => setSelectedTicker(row.ticker)}
-                              className={cn(
-                                "cursor-pointer border-t border-white/5 transition-colors hover:bg-white/[0.03]",
-                                selectedTicker === row.ticker && "bg-white/[0.04]"
-                              )}
-                            >
-                              <td className="px-4 py-4 align-top">
-                                <div className="flex items-center gap-3">
-                                  <AssetLogo asset={row.asset} size="sm" />
-                                  <div>
-                                    <div className="font-medium">{row.ticker}</div>
-                                    <div className="text-xs text-muted-foreground">{row.name}</div>
-                                  </div>
-                                </div>
-                              </td>
-                              <td className="px-4 py-4 align-top"><Badge tone={row.statusTone}>{row.statusLabel}</Badge></td>
-                              <td className="px-4 py-4 align-top"><Badge tone={row.intentTone}>{row.intentLabel}</Badge></td>
-                              <td className="px-4 py-4 align-top">
-                                <div>{row.whenLabel}</div>
-                                <div className="text-xs text-muted-foreground">{row.reviewLabel}</div>
-                              </td>
-                              <td className="px-4 py-4 align-top text-xs leading-5 text-muted-foreground">{row.timeLabel}</td>
-                              <td className="px-4 py-4 align-top">
-                                <div className="max-w-[340px] text-sm leading-6 text-foreground">{row.reasonLabel}</div>
-                              </td>
-                              <td className="px-4 py-4 align-top text-xs leading-5 text-muted-foreground">
-                                <div>Entrada {fmtMoney(row.entryPrice)}</div>
-                                <div>Stop {fmtMoney(row.trailingStop ?? row.stopLoss)}</div>
-                                <div>Alvo {fmtMoney(row.targetPrice)}</div>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                    </div>
                   </CardContent>
                 </Card>
 
@@ -1621,13 +1803,27 @@ export default function Page() {
                         </div>
                       )}
                       <div>
+                        <label className="mb-1 block text-xs uppercase tracking-wider text-muted-foreground">Buscar ativo</label>
+                        <div className="relative">
+                          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                          <input
+                            type="search"
+                            value={realFormAssetSearch}
+                            onChange={(event) => setRealFormAssetSearch(event.target.value)}
+                            placeholder="Digite ticker ou empresa"
+                            className="w-full rounded-xl border border-white/10 bg-white/5 pl-10 pr-3 py-2 text-sm text-foreground outline-none focus:border-sky-400/50"
+                          />
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">{realFormAssetOptions.length} resultado(s)</div>
+                      </div>
+                      <div>
                         <label className="mb-1 block text-xs uppercase tracking-wider text-muted-foreground">Empresa</label>
                         <select
                           value={realForm.ticker}
                           onChange={(event) => setRealForm((current) => ({ ...current, ticker: event.target.value }))}
                           className="w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-foreground outline-none focus:border-sky-400/50"
                         >
-                          {state.assets.map((asset) => (
+                          {realFormAssetOptions.map((asset) => (
                             <option key={asset.ticker} value={asset.ticker}>{asset.ticker} · {asset.name}</option>
                           ))}
                         </select>

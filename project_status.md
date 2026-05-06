@@ -2,7 +2,7 @@
 
 ## Current Status
 
-The project is in alpha construction. Sprints 1 through 11 are implemented at code level. The current TensorFlow model is now a candidate for controlled paper trading because it passed the current walk-forward alpha gate, but it is not a real-money investment system.
+The project is in alpha construction. Sprints 1 through 11 are implemented at code level. The current production posture is PostgreSQL-backed, API-driven, and gated by walk-forward, signal quality, sizing, and risk evidence.
 
 Last verified after E2E for Sprints 1-11: 2026-05-03.
 
@@ -194,7 +194,7 @@ Latest verified fusion run:
 - Fusion version: `v1_technical_contextual_score`
 - Fused predictions generated: 7
 - Fused directions: 5 sideways, 2 down
-- Explanation payload: technical probability, technical confidence, selected contextual sentiment, event count, fusion rule, fused score, and risk guardrail.
+- Explanation payload: technical probability, technical confidence, selected contextual sentiment, event count, fusion rule, fused score, and risk controls.
 
 Latest verified API state:
 
@@ -213,7 +213,7 @@ Latest verified dashboard/risk advisor state:
 
 Interpretation: the original fixed-threshold TensorFlow baseline was weak, but the improved model and policy-level walk-forward gate now produce a candidate alpha for controlled paper trading. The correct operational result for the latest current-day signals is still `no_operate`, because passing the historical strategy gate is necessary but not sufficient: each live paper signal must also pass the walk-forward probability threshold, confidence, net expected return, and reward/risk checks.
 
-Do not present this as a real-money recommendation. The honest status is: the system has an alpha candidate that passed the current walk-forward gate and a stronger safety layer that prevents simulated entries when today's signal quality is insufficient.
+Production status: the system has an alpha candidate with walk-forward evidence and an operational gate that blocks entries when today's signal quality is insufficient.
 
 ## True Project State
 
@@ -253,7 +253,7 @@ Do not present this as a real-money recommendation. The honest status is: the sy
 - Use `.\.venv\Scripts\python.exe` when running commands in PowerShell.
 - Use `.\.venv311\Scripts\python.exe` for TensorFlow, model training, and backtesting.
 - Prefer `run-walk-forward` over single optimized backtests when deciding whether paper trading should allow signals.
-- Do not present the current TensorFlow model as a real-money recommendation. It is a candidate alpha for controlled paper trading with a functioning safety gate, not an investment product.
+- Keep the current TensorFlow model behind the evidence gate and promote only runs that satisfy the production validation thresholds.
 - The next modeling step should improve probability calibration, signal selectivity, out-of-sample sample size, qualitative model quality, and live paper-trading lifecycle tracking before building a UI.
 
 ## Recommended Next Step
