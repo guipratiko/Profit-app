@@ -86,7 +86,7 @@ const INTENT_FILTERS: Array<{ value: IntentFilter; label: string; tone: Tone }> 
   { value: "ALL", label: "Todos", tone: "neutral" },
   { value: "BUY", label: "Comprar", tone: "good" },
   { value: "SELL", label: "Vender", tone: "bad" },
-  { value: "NO_OPERATE", label: "Nao operar", tone: "warn" }
+  { value: "NO_OPERATE", label: "Não operar", tone: "warn" }
 ];
 const HORIZON_TO_DAYS: Record<string, number> = {
   "7d": 7,
@@ -198,11 +198,21 @@ function badgeTone(value?: string | null): Tone {
   return "neutral";
 }
 
+function gateStatusLabel(status?: string | null) {
+  const normalized = String(status || "").toLowerCase();
+  if (normalized === "approved") return "Aprovado";
+  if (normalized === "blocked") return "Bloqueado";
+  if (normalized === "pending") return "Pendente";
+  if (normalized === "paper_gate_monitoring") return "Gate em monitoramento";
+  if (normalized.includes("monitoring")) return "Em monitoramento";
+  return normalized ? normalized.replaceAll("_", " ") : "Sem status";
+}
+
 function actionLabel(action?: string | null) {
   if (!action) return "N/A";
   if (action === "ENTER_LONG") return "Comprar";
-  if (action === "WATCHLIST") return "Nao operar";
-  if (action === "NO_TRADE") return "Nao operar";
+  if (action === "WATCHLIST") return "Não operar";
+  if (action === "NO_TRADE") return "Não operar";
   return action.replaceAll("_", " ");
 }
 
@@ -355,8 +365,8 @@ function horizonLabel(signal?: PaperSignal | null, alertMeta?: Record<string, an
 function signalIntent(signal?: PaperSignal | null): { label: string; tone: Tone } {
   const action = String(signal?.operational_action || signal?.decision || "").toUpperCase();
   if (action.includes("ENTER") || action.includes("SIMULATE_LONG")) return { label: "Comprar", tone: "good" };
-  if (action.includes("WATCH")) return { label: "Nao operar", tone: "warn" };
-  if (action.includes("NO_TRADE") || action.includes("NO_OPERATE")) return { label: "Nao operar", tone: "bad" };
+  if (action.includes("WATCH")) return { label: "Não operar", tone: "warn" };
+  if (action.includes("NO_TRADE") || action.includes("NO_OPERATE")) return { label: "Não operar", tone: "bad" };
   return { label: actionLabel(signal?.operational_action || signal?.decision), tone: badgeTone(signal?.operational_action || signal?.decision) };
 }
 
@@ -387,7 +397,7 @@ function actionExplanation(
     return decisionExplanation(
       signal?.block_reason,
       signal,
-      "Nao operar: ainda nao ha entrada autorizada para este ativo no snapshot atual."
+      "Não operar: ainda não há entrada autorizada para este ativo no snapshot atual."
     );
   }
 
@@ -841,13 +851,7 @@ export default function Page() {
       }
     });
     const drawdownPeak = Number(state.gate?.metrics?.max_drawdown ?? NaN);
-    const gateLabel = gateStatus === "approved"
-      ? "Aprovado"
-      : gateStatus === "blocked"
-        ? "Bloqueado"
-        : gateStatus === "pending"
-          ? "Pendente"
-          : gateStatus.replaceAll("_", " ");
+    const gateLabel = gateStatusLabel(gateStatus);
     const gateTone: Tone = gateStatus === "approved" ? "good" : gateStatus === "blocked" ? "bad" : "warn";
     return {
       openPnl: realPortfolioSummary.unrealizedPnl,
@@ -895,7 +899,7 @@ export default function Page() {
       losingPositions,
       bestRealPosition,
       worstRealPosition,
-      gateLabel: gateStatus.replaceAll("_", " ")
+      gateLabel: gateStatusLabel(gateStatus)
     };
   }, [investmentRows, paperSignals, state.realPositions, gateStatus]);
   const movingPortfolioItems = useMemo(() => {
@@ -1084,12 +1088,12 @@ export default function Page() {
 
         <section className="grid gap-3 xl:grid-cols-[1fr_1.35fr_1fr]">
           <div className="glass-strong min-h-[178px] overflow-hidden rounded-2xl p-5">
-            <div className="flex items-center justify-between gap-3">
-              <div>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
                 <div className="text-[11px] font-semibold uppercase tracking-wider text-emerald-200/90">Oportunidade</div>
                 <div className="mt-1 text-xs text-muted-foreground">Melhores janelas de compra do snapshot atual</div>
               </div>
-              <Badge tone="good">{marketPanelStats.buyCount} compra</Badge>
+              <Badge tone="good" className="shrink-0">{marketPanelStats.buyCount} compras</Badge>
             </div>
             <div className="mt-4 space-y-2">
               {opportunityRows.map((row) => (
@@ -1117,26 +1121,26 @@ export default function Page() {
 
           <div className="glass-strong relative min-h-[178px] overflow-hidden rounded-2xl p-5">
             <div className="flex items-start justify-between gap-3">
-              <div>
+              <div className="min-w-0">
                 <div className="text-[11px] font-semibold uppercase tracking-wider text-sky-200/90">Carteira em movimento</div>
-                <div className="mt-2 text-3xl font-semibold tracking-tight">{fmtMoney(realPortfolioSummary.marketValue)}</div>
+                <div className="mt-2 break-words text-3xl font-semibold tracking-tight">{fmtMoney(realPortfolioSummary.marketValue)}</div>
                 <div className={cn("mt-1 text-sm font-medium", (realPortfolioSummary.unrealizedPnl || 0) >= 0 ? "text-emerald-300" : "text-rose-300")}>
                   {fmtMoney(realPortfolioSummary.unrealizedPnl)} · {fmtPercent(realPortfolioSummary.unrealizedReturn, 2)}
                 </div>
               </div>
-              <Badge tone={realPortfolioSummary.unrealizedPnl >= 0 ? "good" : "bad"}>{marketPanelStats.realCount} entradas</Badge>
+              <Badge tone={realPortfolioSummary.unrealizedPnl >= 0 ? "good" : "bad"} className="shrink-0">{marketPanelStats.realCount} entradas</Badge>
             </div>
             <div className="mt-5 grid gap-2 border-y border-white/10 py-3 sm:grid-cols-2 xl:grid-cols-3">
               {movingPortfolioItems.map((item) => (
                 <div key={item.label} className="min-w-0 rounded-lg border border-white/10 bg-white/[0.025] px-3 py-2">
                   <div className="text-[10px] font-semibold uppercase tracking-wider text-sky-100/60">{item.label}</div>
-                  <div className={cn("mt-1 truncate text-sm font-semibold text-sky-50", item.tone)} title={item.value}>
+                  <div className={cn("mt-1 line-clamp-2 break-words text-sm font-semibold leading-5 text-sky-50", item.tone)} title={item.value}>
                     {item.value}
                   </div>
                 </div>
               ))}
             </div>
-            <div className="mt-4 grid grid-cols-3 gap-2 text-xs">
+            <div className="mt-4 grid gap-2 text-xs sm:grid-cols-3">
               <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="text-muted-foreground">Investido</div><div className="mt-1 font-semibold">{fmtMoney(realPortfolioSummary.invested)}</div></div>
               <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="text-muted-foreground">Ganhos</div><div className="mt-1 font-semibold text-emerald-300">{marketPanelStats.winningPositions}</div></div>
               <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="text-muted-foreground">Perdas</div><div className="mt-1 font-semibold text-rose-300">{marketPanelStats.losingPositions}</div></div>
@@ -1144,18 +1148,18 @@ export default function Page() {
           </div>
 
           <div className="glass-strong min-h-[178px] rounded-2xl p-5">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="text-[11px] font-semibold uppercase tracking-wider text-violet-100/90">Estatisticas</div>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[11px] font-semibold uppercase tracking-wider text-violet-100/90">Estatísticas</div>
                 <div className="mt-1 text-xs text-muted-foreground">Sinais, filtros e risco em tempo real</div>
               </div>
-              <Badge tone={badgeTone(gateStatus)}>{marketPanelStats.gateLabel}</Badge>
+              <Badge tone={badgeTone(gateStatus)} className="shrink-0 normal-case tracking-normal">{marketPanelStats.gateLabel}</Badge>
             </div>
             <div className="mt-4 grid grid-cols-2 gap-2 text-sm">
               <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="text-xs text-muted-foreground">Monitorados</div><div className="mt-1 text-xl font-semibold">{marketPanelStats.monitored}</div></div>
-              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="text-xs text-muted-foreground">Nao operar</div><div className="mt-1 text-xl font-semibold">{marketPanelStats.noOperateCount}</div></div>
-              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="text-xs text-muted-foreground">Melhor P/L</div><div className="mt-1 font-semibold text-emerald-300">{marketPanelStats.bestRealPosition ? `${marketPanelStats.bestRealPosition.ticker} ${fmtMoney(marketPanelStats.bestRealPosition.unrealized_pnl)}` : "-"}</div></div>
-              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="text-xs text-muted-foreground">Pior P/L</div><div className="mt-1 font-semibold text-rose-300">{marketPanelStats.worstRealPosition ? `${marketPanelStats.worstRealPosition.ticker} ${fmtMoney(marketPanelStats.worstRealPosition.unrealized_pnl)}` : "-"}</div></div>
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="text-xs text-muted-foreground">Não operar</div><div className="mt-1 text-xl font-semibold">{marketPanelStats.noOperateCount}</div></div>
+              <div className="min-w-0 rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="text-xs text-muted-foreground">Melhor P/L</div><div className="mt-1 break-words font-semibold leading-5 text-emerald-300">{marketPanelStats.bestRealPosition ? `${marketPanelStats.bestRealPosition.ticker} ${fmtMoney(marketPanelStats.bestRealPosition.unrealized_pnl)}` : "-"}</div></div>
+              <div className="min-w-0 rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="text-xs text-muted-foreground">Pior P/L</div><div className="mt-1 break-words font-semibold leading-5 text-rose-300">{marketPanelStats.worstRealPosition ? `${marketPanelStats.worstRealPosition.ticker} ${fmtMoney(marketPanelStats.worstRealPosition.unrealized_pnl)}` : "-"}</div></div>
             </div>
           </div>
         </section>
@@ -1163,7 +1167,7 @@ export default function Page() {
         <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as DashboardTab)} className="w-full">
           <TabsList>
             <TabsTrigger value="trending"><TrendingUp className="h-4 w-4" /> Trending</TabsTrigger>
-            <TabsTrigger value="predictions"><BrainCircuit className="h-4 w-4" /> Previsoes</TabsTrigger>
+            <TabsTrigger value="predictions"><BrainCircuit className="h-4 w-4" /> Previsões</TabsTrigger>
             <TabsTrigger value="investments"><WalletCards className="h-4 w-4" /> Meus Investimentos</TabsTrigger>
           </TabsList>
 
@@ -1353,7 +1357,7 @@ export default function Page() {
               <Card>
                 <CardHeader>
                   <CardTitle>Gate 90 dias</CardTitle>
-                  <Badge tone={badgeTone(gateStatus)}>{gateStatus.replaceAll("_", " ")}</Badge>
+                  <Badge tone={badgeTone(gateStatus)} className="normal-case tracking-normal">{gateStatusLabel(gateStatus)}</Badge>
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <GateChart gates={state.gate?.gates || {}} />
@@ -1385,7 +1389,7 @@ export default function Page() {
                       Visão sempre visível: P/L em aberto, exposição, risco em ATR, drawdown desde pico e situação do gate v2 hoje.
                     </div>
                   </div>
-                  <Badge tone={traderCockpit.gateTone}>Gate hoje: {traderCockpit.gateLabel}</Badge>
+                  <Badge tone={traderCockpit.gateTone} className="normal-case tracking-normal">Gate hoje: {traderCockpit.gateLabel}</Badge>
                 </CardHeader>
                 <CardContent className="space-y-3">
                   <div className="grid grid-cols-2 gap-3 text-sm md:grid-cols-5">
