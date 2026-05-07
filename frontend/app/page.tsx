@@ -755,8 +755,8 @@ export default function Page() {
   }, [investmentRows, state.realPositions, state.gate, gateStatus, realPortfolioSummary]);
   const opportunityRows = useMemo(() => {
     const ranked = [...investmentRows].sort((left, right) => {
-      const leftIntentBoost = classifyIntentLabel(left.intentLabel) === "BUY" ? 1 : 0;
-      const rightIntentBoost = classifyIntentLabel(right.intentLabel) === "BUY" ? 1 : 0;
+      const leftIntentBoost = left.signal?.operational_action === "ENTER_LONG" ? 1 : 0;
+      const rightIntentBoost = right.signal?.operational_action === "ENTER_LONG" ? 1 : 0;
       if (leftIntentBoost !== rightIntentBoost) return rightIntentBoost - leftIntentBoost;
       const leftScore = Number(left.signal?.net_expected_return ?? left.signal?.probability_win ?? left.signal?.probability_up ?? -1);
       const rightScore = Number(right.signal?.net_expected_return ?? right.signal?.probability_win ?? right.signal?.probability_up ?? -1);
@@ -770,7 +770,8 @@ export default function Page() {
       .slice(0, 3);
   }, [state.realPositions]);
   const marketPanelStats = useMemo(() => {
-    const buyCount = investmentRows.filter((row) => classifyIntentLabel(row.intentLabel) === "BUY").length;
+    const buyCount = finiteCount(paperSignals.operational_actions?.ENTER_LONG)
+      ?? investmentRows.filter((row) => row.signal?.operational_action === "ENTER_LONG").length;
     const noOperateCount = finiteCount(paperSignals.operational_actions?.NO_TRADE)
       ?? finiteCount(paperSignals.no_operate_count)
       ?? investmentRows.filter((row) => classifyIntentLabel(row.intentLabel) === "NO_OPERATE").length;
@@ -992,10 +993,10 @@ export default function Page() {
                   className="flex w-full flex-col items-start gap-3 rounded-xl border border-white/10 bg-white/[0.035] px-3 py-3 text-left transition-colors hover:border-emerald-300/30 hover:bg-emerald-300/[0.06] sm:flex-row sm:items-center sm:justify-between sm:py-2"
                 >
                   <div className="flex min-w-0 items-center gap-3">
-                    <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full", classifyIntentLabel(row.intentLabel) === "BUY" ? "animate-pulse bg-emerald-300 shadow-[0_0_14px_rgba(52,211,153,0.9)]" : "bg-amber-200/80")} />
+                    <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full", row.signal?.operational_action === "ENTER_LONG" ? "animate-pulse bg-emerald-300 shadow-[0_0_14px_rgba(52,211,153,0.9)]" : "bg-amber-200/80")} />
                     <div className="min-w-0">
                       <div className="truncate text-sm font-semibold">{row.ticker}</div>
-                      <div className="truncate text-xs text-muted-foreground">{row.intentLabel} · {fmtPercent(row.signal?.net_expected_return, 2)}</div>
+                      <div className="truncate text-xs text-muted-foreground">{actionLabel(row.signal?.operational_action || row.signal?.decision)} · {fmtPercent(row.signal?.net_expected_return, 2)}</div>
                     </div>
                   </div>
                   <div className="w-full text-left text-xs sm:w-auto sm:text-right">
