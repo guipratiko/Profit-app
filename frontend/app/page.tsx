@@ -33,7 +33,6 @@ import { GateChart } from "@/components/gate-chart";
 type Horizon = "7d" | "3m" | "1y";
 type DashboardTab = "trending" | "predictions" | "investments";
 type IntentFilter = "ALL" | "BUY" | "SELL" | "NO_OPERATE";
-type NavItem = { value: DashboardTab; label: string; icon: typeof TrendingUp; count: number; hint: string };
 type Thesis = Record<string, any>;
 type Tone = "neutral" | "good" | "warn" | "bad" | "info";
 type PortfolioIntent = {
@@ -41,7 +40,7 @@ type PortfolioIntent = {
   ticker: string;
   name: string;
   signal?: PaperSignal | null;
-  position?: Position;
+  position?: RealPosition;
   alert?: RiskAlert;
   thesis: Thesis | null;
   alertMeta: Record<string, any> | null;
@@ -228,6 +227,10 @@ function latestAlert(alerts: RiskAlert[], ticker: string) {
 }
 
 function latestPosition(positions: Position[], ticker: string) {
+  return positions.find((position) => position.ticker === ticker);
+}
+
+function realPositionForTicker(positions: RealPosition[], ticker: string) {
   return positions.find((position) => position.ticker === ticker);
 }
 
@@ -445,17 +448,16 @@ function modelDirectionLabel(direction?: string | null) {
   return direction || "-";
 }
 
-function positionState(position?: Position, signal?: PaperSignal | null): { label: string; tone: Tone } {
-  if (position?.status === "open") return { label: "Em carteira", tone: "good" };
-  if (position?.status?.startsWith("closed")) return { label: "Posicao anterior encerrada", tone: "neutral" };
+function positionState(inRealPortfolio: boolean, signal?: PaperSignal | null): { label: string; tone: Tone } {
+  if (inRealPortfolio) return { label: "Em carteira", tone: "good" };
   const action = String(signal?.operational_action || signal?.decision || "").toUpperCase();
   if (action.includes("ENTER")) return { label: "Entrada permitida", tone: "info" };
   if (action.includes("WATCH")) return { label: "Em observacao", tone: "warn" };
   return { label: "Sem posicao", tone: "neutral" };
 }
 
-function nextReviewLabel(position: Position | undefined, signal: PaperSignal | null | undefined, alertMeta: Record<string, any> | null) {
-  if (position?.status === "open") {
+function nextReviewLabel(inRealPortfolio: boolean, signal: PaperSignal | null | undefined, alertMeta: Record<string, any> | null) {
+  if (inRealPortfolio) {
     const daysRemaining = Number(alertMeta?.days_remaining);
     if (Number.isFinite(daysRemaining)) {
       return daysRemaining > 0 ? `${daysRemaining} dia(s) restantes` : "Encerrar hoje";
@@ -718,13 +720,13 @@ export default function Page() {
       const prediction = state.predictions[asset.ticker];
       const signal = prediction?.paper_signal || signalForTicker(state.signals, asset.ticker);
       const thesis = thesisFor(signal);
-      const position = latestPosition(state.positions, asset.ticker);
+      const position = realPositionForTicker(state.realPositions, asset.ticker);
       const alert = latestAlert(state.alerts, asset.ticker);
       const alertMeta = parseJson<Record<string, any>>(alert?.metadata_json || null);
-      const currentPositionOpen = position?.status === "open";
-      const intent = currentPositionOpen ? positionIntent(signal, alert) : signalIntent(signal);
-      const status = positionState(position, signal);
-      const reasonLabel = actionExplanation(currentPositionOpen, intent.label, signal, alert);
+      const inRealPortfolio = Boolean(position);
+      const intent = inRealPortfolio ? positionIntent(signal, alert) : signalIntent(signal);
+      const status = positionState(inRealPortfolio, signal);
+      const reasonLabel = actionExplanation(inRealPortfolio, intent.label, signal, alert);
 
       return {
         asset,
@@ -739,21 +741,21 @@ export default function Page() {
         intentTone: intent.tone,
         statusLabel: status.label,
         statusTone: status.tone,
-        whenLabel: nextReviewLabel(position, signal, alertMeta),
-        timeLabel: currentPositionOpen && alert?.evaluated_at ? formatDateTime(alert.evaluated_at) : REVIEW_TIME_LABEL,
+        whenLabel: nextReviewLabel(inRealPortfolio, signal, alertMeta),
+        timeLabel: inRealPortfolio && alert?.evaluated_at ? formatDateTime(alert.evaluated_at) : REVIEW_TIME_LABEL,
         reasonLabel,
         reviewLabel: `${formatShortDate(signal?.signal_date)} · janela ${horizonLabel(signal, alertMeta)}`,
         whyLines: buildWhyLines(signal, thesis, alert, alertMeta),
-        entryPrice: currentPositionOpen ? (position?.entry_price ?? signal?.suggested_entry) : (signal?.suggested_entry ?? position?.entry_price),
-        currentPrice: currentPositionOpen ? (position?.current_price ?? alert?.current_price ?? signal?.reference_price) : (signal?.reference_price ?? position?.current_price ?? alert?.current_price),
-        stopLoss: currentPositionOpen ? (position?.stop_loss ?? signal?.stop_loss) : (signal?.stop_loss ?? position?.stop_loss),
-        partialTarget: currentPositionOpen ? (position?.partial_target ?? signal?.partial_target) : (signal?.partial_target ?? position?.partial_target),
-        targetPrice: currentPositionOpen ? (position?.target_price ?? signal?.target_price) : (signal?.target_price ?? position?.target_price),
+        entryPrice: inRealPortfolio ? (position?.entry_price ?? signal?.suggested_entry) : signal?.suggested_entry,
+        currentPrice: inRealPortfolio ? (position?.current_price ?? alert?.current_price ?? signal?.reference_price) : (signal?.reference_price ?? alert?.current_price),
+        stopLoss: signal?.stop_loss,
+        partialTarget: signal?.partial_target,
+        targetPrice: signal?.target_price,
         trailingStop: alertMeta?.trailing_stop !== undefined ? Number(alertMeta.trailing_stop) : undefined,
         daysRemaining: Number.isFinite(Number(alertMeta?.days_remaining)) ? Number(alertMeta?.days_remaining) : null
       };
     });
-  }, [state.assets, state.predictions, state.signals, state.positions, state.alerts]);
+  }, [state.assets, state.predictions, state.signals, state.realPositions, state.alerts]);
 
   const searchedInvestmentRows = useMemo(
     () => investmentRows.filter((row) => assetMatchesQuery(row.asset, assetSearch)),
@@ -778,7 +780,7 @@ export default function Page() {
     }, { ALL: 0, BUY: 0, SELL: 0, NO_OPERATE: 0 });
   }, [investmentRows]);
   const selectedAsset = selectedInvestment?.asset || assetByTicker[selectedTicker] || filteredAssets[0] || state.assets[0] || null;
-  const openInvestmentCount = investmentRows.filter((row) => row.position?.status === "open").length;
+  const openInvestmentCount = investmentRows.filter((row) => row.position).length;
   const realPortfolioRows = useMemo<RealPortfolioRow[]>(() => {
     return state.realPositions.map((position) => {
       const intent = investmentRows.find((row) => row.ticker === position.ticker);
@@ -1011,13 +1013,6 @@ export default function Page() {
     }
   }
 
-  function goToTab(tab: DashboardTab) {
-    setActiveTab(tab);
-    requestAnimationFrame(() => {
-      document.getElementById("dashboard-tabs")?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
-  }
-
   function updateRealDraft(positionId: string, patch: Partial<RealPositionFormState>) {
     setRealDrafts((current) => ({
       ...current,
@@ -1059,12 +1054,6 @@ export default function Page() {
 
   if (loading) return <main className="min-h-screen p-4 md:p-6"><LoadingPanel message="Carregando mesa operacional..." /></main>;
 
-  const navItems: NavItem[] = [
-    { value: "trending", label: "Trending", icon: TrendingUp, count: filteredAssets.length, hint: "ranking e graficos" },
-    { value: "predictions", label: "Previsoes", icon: BrainCircuit, count: state.signals.length || filteredAssets.length, hint: "modelo e gate" },
-    { value: "investments", label: "Carteira", icon: WalletCards, count: openInvestmentCount, hint: "acoes e posicoes" },
-  ];
-
   return (
     <main className="min-h-screen p-4 md:p-8">
       <div className="mx-auto flex max-w-7xl flex-col gap-6">
@@ -1089,40 +1078,6 @@ export default function Page() {
             <Button onClick={() => void auditConselheiro()} disabled={busyAudit}><ShieldCheck className="h-4 w-4" /> Conselheiro</Button>
           </div>
         </header>
-
-        <nav className="sticky top-3 z-30 rounded-2xl border border-white/10 bg-slate-950/82 p-2 shadow-[0_18px_60px_rgba(0,0,0,0.35)] backdrop-blur-xl">
-          <div className="grid gap-2 sm:grid-cols-3">
-            {navItems.map((item) => {
-              const Icon = item.icon;
-              const selected = activeTab === item.value;
-              return (
-                <button
-                  key={item.value}
-                  type="button"
-                  onClick={() => goToTab(item.value)}
-                  className={cn(
-                    "flex min-h-14 items-center justify-between gap-3 rounded-xl border px-3 py-2 text-left transition-colors",
-                    selected
-                      ? "border-sky-300/45 bg-sky-400/15 text-sky-50 shadow-[0_0_24px_rgba(56,189,248,0.22)]"
-                      : "border-white/10 bg-white/[0.035] text-muted-foreground hover:border-white/20 hover:bg-white/[0.06] hover:text-foreground"
-                  )}
-                  aria-current={selected ? "page" : undefined}
-                >
-                  <span className="flex min-w-0 items-center gap-3">
-                    <span className={cn("grid h-9 w-9 shrink-0 place-items-center rounded-lg border", selected ? "border-sky-200/40 bg-sky-300/15" : "border-white/10 bg-white/[0.04]")}> 
-                      <Icon className="h-4 w-4" />
-                    </span>
-                    <span className="min-w-0">
-                      <span className="block truncate text-sm font-semibold">{item.label}</span>
-                      <span className="block truncate text-[11px] text-muted-foreground">{item.hint}</span>
-                    </span>
-                  </span>
-                  <Badge tone={selected ? "info" : "neutral"}>{item.count}</Badge>
-                </button>
-              );
-            })}
-          </div>
-        </nav>
 
         {error && <div className="glass rounded-2xl border-rose-400/30 bg-rose-400/5 px-4 py-3 text-sm text-rose-200">{error}</div>}
 
@@ -1204,7 +1159,7 @@ export default function Page() {
           </div>
         </section>
 
-        <Tabs id="dashboard-tabs" value={activeTab} onValueChange={(value) => setActiveTab(value as DashboardTab)} className="w-full scroll-mt-28">
+        <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as DashboardTab)} className="w-full">
           <TabsList>
             <TabsTrigger value="trending"><TrendingUp className="h-4 w-4" /> Trending</TabsTrigger>
             <TabsTrigger value="predictions"><BrainCircuit className="h-4 w-4" /> Previsoes</TabsTrigger>
