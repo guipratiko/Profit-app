@@ -1,8 +1,26 @@
+# syntax=docker/dockerfile:1
+# Easypanel pode enviar contexto de build vazio. O código vem de clone Git
+# (build args opcionais: GIT_REPO, GIT_REF, GIT_SHA).
+
+FROM alpine:3.20 AS src
+ARG GIT_REPO=https://github.com/guipratiko/Profit-app.git
+ARG GIT_REF=main
+ARG GIT_SHA=undefined
+RUN apk add --no-cache git ca-certificates
+WORKDIR /repo
+RUN set -eux \
+    && if [ "${GIT_SHA}" != "undefined" ] && [ -n "${GIT_SHA}" ]; then \
+         git clone -- "${GIT_REPO}" . \
+         && git checkout --detach "${GIT_SHA}"; \
+       else \
+         git clone --depth 1 --branch "${GIT_REF}" -- "${GIT_REPO}" .; \
+       fi
+
 FROM python:3.11-slim
 
 ARG GIT_SHA=unknown
 LABEL org.opencontainers.image.title="profit-app-api" \
-      org.opencontainers.image.revision="$GIT_SHA"
+      org.opencontainers.image.revision="${GIT_SHA}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -19,15 +37,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.runtime.txt ./requirements.runtime.txt
+COPY --from=src /repo/requirements.runtime.txt ./requirements.runtime.txt
 
 RUN pip install --upgrade pip \
     && pip install -r requirements.runtime.txt
 
-COPY app ./app
-COPY storage ./storage_seed
+COPY --from=src /repo/app ./app
+COPY --from=src /repo/storage ./storage_seed
 
-# Gerado na imagem (evita COPY de scripts/ quando o contexto no Easypanel vem incompleto).
 RUN mkdir -p scripts \
     && printf '%s\n' \
         '#!/bin/sh' \
