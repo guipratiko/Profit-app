@@ -125,6 +125,18 @@ const REASON_LABELS: Record<string, string> = {
   beats_buy_hold_average: "Ainda nao supera o buy and hold medio"
 };
 
+const TECHNICAL_VALIDATION_REASONS = new Set([
+  "technical_fallback_validation_edge_failed",
+  "technical_fallback_test_min_trades_failed",
+  "technical_fallback_test_return_positive_failed",
+  "technical_fallback_test_avg_return_positive_failed",
+  "technical_fallback_profitable_tickers_acceptable_failed",
+  "trade_outcome_min_test_trades_failed",
+  "trade_outcome_avg_return_positive_failed",
+  "trade_outcome_win_rate_acceptable_failed",
+  "strategy_gate_failed",
+]);
+
 type DashboardState = {
   assets: Asset[];
   predictions: Record<string, PredictionPayload>;
@@ -245,14 +257,74 @@ function reasonTokens(reason?: string | null) {
   if (!reason) return [] as string[];
   return reason
     .split(",")
-    .map((token) => token.trim())
+    .map((token) => token.trim().replace(/^aggressive_alpha_override:/, ""))
     .filter(Boolean);
 }
 
-function formatReason(reason?: string | null, fallback = "Sem bloqueios ativos") {
+function uniqueReasonTokens(reason?: string | null) {
   const tokens = reasonTokens(reason);
+  return Array.from(new Set(tokens.map((token) => token.toLowerCase())));
+}
+
+function formatReason(reason?: string | null, fallback = "Sem bloqueios ativos") {
+  const tokens = uniqueReasonTokens(reason);
   if (!tokens.length) return fallback;
-  return tokens.map((token) => REASON_LABELS[token.toLowerCase()] || token.replaceAll("_", " ")).join(" · ");
+  return tokens.map((token) => REASON_LABELS[token] || token.replaceAll("_", " ")).join(" · ");
+}
+
+function decisionExplanation(
+  reason?: string | null,
+  signal?: PaperSignal | null,
+  fallback = "Sem bloqueios ativos"
+) {
+  const tokens = uniqueReasonTokens(reason);
+  if (!tokens.length) return fallback;
+  const hasTechnicalValidation = tokens.some((token) => TECHNICAL_VALIDATION_REASONS.has(token));
+  const hasVolatility = tokens.includes("volatility_above_limit") || tokens.includes("volatility_percentile_above_80");
+  const hasNegativeEv = tokens.includes("net_expected_return_not_positive");
+  const hasWeakProbability = tokens.includes("probability_win_below_enter_threshold") || tokens.includes("probability_up_below_strategy_threshold");
+  const hasWeakEdge = tokens.includes("win_minus_loss_edge_below_minimum") || tokens.includes("kelly_edge_below_minimum");
+  const hasSizingIssue = tokens.includes("position_size_zero") || tokens.includes("rounded_to_zero_shares") || tokens.includes("exposure_caps_exhausted");
+  const hasStaleData = tokens.includes("data_stale");
+  const hasEventRisk = tokens.includes("event_within_48h") || tokens.includes("regime_divergence_high");
+
+  if (hasStaleData) {
+    return "Entrada vetada porque o preco de referencia esta defasado. Atualize os dados antes de confiar no sinal.";
+  }
+  if (hasSizingIssue) {
+    return "Entrada vetada porque o controle de risco calculou lote zero ou exposicao indisponivel para este ativo.";
+  }
+  if (hasNegativeEv) {
+    return "Entrada vetada porque o retorno esperado liquido nao paga custo, spread e risco do trade.";
+  }
+  if (hasVolatility && hasTechnicalValidation) {
+    return "Entrada vetada: o ativo esta volátil e a estrategia nao confirmou vantagem consistente no teste recente. Melhor aguardar confirmacao.";
+  }
+  if (hasVolatility) {
+    return "Entrada vetada pela volatilidade: o stop precisaria ficar largo demais para o risco atual.";
+  }
+  if (hasTechnicalValidation) {
+    return "Entrada vetada porque o padrao ainda nao provou retorno liquido consistente nos testes recentes. Observar ate o edge aparecer com mais robustez.";
+  }
+  if (hasWeakProbability || hasWeakEdge) {
+    return "Entrada vetada porque a vantagem estatistica ainda esta pequena para justificar risco real.";
+  }
+  if (hasEventRisk) {
+    return "Entrada vetada porque contexto e preco estao divergindo; o sinal pode estar reagindo a ruido de curto prazo.";
+  }
+  return formatReason(reason, fallback);
+}
+
+function releaseCondition(reason?: string | null) {
+  const tokens = uniqueReasonTokens(reason);
+  if (!tokens.length) return null;
+  if (tokens.includes("data_stale")) return "Liberar apos refresh de mercado com preco atualizado.";
+  if (tokens.includes("position_size_zero") || tokens.includes("rounded_to_zero_shares")) return "Liberar quando o lote calculado ficar maior que zero dentro do limite de risco.";
+  if (tokens.includes("net_expected_return_not_positive")) return "Liberar quando o EV liquido voltar a positivo depois dos custos.";
+  if (tokens.includes("volatility_above_limit") || tokens.includes("volatility_percentile_above_80")) return "Liberar quando a volatilidade cair ou o alvo compensar o stop maior.";
+  if (tokens.some((token) => TECHNICAL_VALIDATION_REASONS.has(token))) return "Liberar quando o proximo teste/snapshot mostrar retorno medio positivo e edge persistente.";
+  if (tokens.includes("probability_win_below_enter_threshold") || tokens.includes("win_minus_loss_edge_below_minimum")) return "Liberar quando probabilidade e diferenca ganho-perda subirem acima do limiar.";
+  return null;
 }
 
 function sleep(ms: number) {
@@ -372,9 +444,13 @@ function buildWhyLines(
 ) {
   const lines: string[] = [];
   if (alert?.reason) {
-    lines.push(formatReason(alert.reason));
+    lines.push(decisionExplanation(alert.reason, signal));
+    const condition = releaseCondition(alert.reason);
+    if (condition) lines.push(condition);
   } else if (signal?.block_reason) {
-    lines.push(formatReason(signal.block_reason));
+    lines.push(decisionExplanation(signal.block_reason, signal));
+    const condition = releaseCondition(signal.block_reason);
+    if (condition) lines.push(condition);
   } else if (String(signal?.operational_action || signal?.decision || "").toUpperCase().includes("ENTER")) {
     lines.push("Edge positivo, sem bloqueio operacional no snapshot atual.");
   }
@@ -616,9 +692,10 @@ export default function Page() {
       const intent = currentPositionOpen ? positionIntent(alert) : signalIntent(signal);
       const status = positionState(position, signal);
       const reasonLabel = currentPositionOpen
-        ? formatReason(alert?.reason, "Sem alerta ativo")
-        : formatReason(
+        ? decisionExplanation(alert?.reason, signal, "Sem alerta ativo")
+        : decisionExplanation(
             signal?.block_reason,
+            signal,
             intent.label === "Comprar" ? "Sem bloqueios e com edge positivo" : "Sem bloqueio explicito"
           );
 
