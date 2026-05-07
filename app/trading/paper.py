@@ -31,12 +31,42 @@ from app.trading.regime import assess_regime, estimate_volatility_percentile
 from app.trading.sizing import decisive_win_probability, size_position, sector_for
 
 
-PAPER_SIGNAL_VERSION = "v8_b3_kelly_regime_gate"
+PAPER_SIGNAL_VERSION = "v9_aggressive_alpha_gate"
 STRICT_NO_OPERATE_VOL_PERCENTILE = 0.80
 STRICT_NO_OPERATE_DIVERGENCE = 0.35
 EVENT_RECENCY_DAYS = 2
 ATR_WINDOW = 14
 REWARD_RISK_TOLERANCE = 1e-9
+AGGRESSIVE_ALPHA_MIN_EFFECTIVE_WIN_PROBABILITY = 0.60
+AGGRESSIVE_ALPHA_MIN_WIN_LOSS_EDGE = 0.18
+AGGRESSIVE_ALPHA_MIN_NET_EXPECTED_RETURN = 0.015
+AGGRESSIVE_ALPHA_MAX_VOLATILITY_MULTIPLIER = 1.45
+
+AGGRESSIVE_ALPHA_SOFT_BLOCK_REASONS = {
+    "regime_divergence_high",
+    "volatility_percentile_above_80",
+    "volatility_above_limit",
+    "strategy_gate_failed",
+    "trade_outcome_min_test_trades_failed",
+    "trade_outcome_avg_return_positive_failed",
+    "trade_outcome_win_rate_acceptable_failed",
+    "technical_fallback_validation_edge_failed",
+    "technical_fallback_test_min_trades_failed",
+    "technical_fallback_test_return_positive_failed",
+    "technical_fallback_test_avg_return_positive_failed",
+    "technical_fallback_profitable_tickers_acceptable_failed",
+    "probability_up_below_strategy_threshold",
+}
+
+
+def _expand_block_reasons(block_reasons: list[str]) -> list[str]:
+    expanded: list[str] = []
+    for reason in block_reasons:
+        for part in str(reason).split(","):
+            cleaned = part.strip()
+            if cleaned:
+                expanded.append(cleaned)
+    return expanded
 
 OPERATIONAL_ACTION_ENTER_LONG = "ENTER_LONG"
 OPERATIONAL_ACTION_WATCHLIST = "WATCHLIST"
@@ -319,6 +349,26 @@ def choose_decision(
     if max_shares <= 0:
         block_reasons.append("position_size_zero")
 
+    expanded_block_reasons = _expand_block_reasons(block_reasons)
+    aggressive_hard_blocks = [
+        reason for reason in expanded_block_reasons if reason not in AGGRESSIVE_ALPHA_SOFT_BLOCK_REASONS
+    ]
+    aggressive_alpha_ok = (
+        bool(block_reasons)
+        and not aggressive_hard_blocks
+        and max_shares > 0
+        and volatility_21d <= policy.max_volatility_21d * AGGRESSIVE_ALPHA_MAX_VOLATILITY_MULTIPLIER
+        and reward_risk_ratio >= (policy.min_reward_risk_ratio - REWARD_RISK_TOLERANCE)
+        and probability_up >= max(
+            AGGRESSIVE_ALPHA_MIN_EFFECTIVE_WIN_PROBABILITY,
+            strategy_probability_threshold or 0.0,
+        )
+        and confidence >= policy.min_confidence
+        and net_expected_return >= AGGRESSIVE_ALPHA_MIN_NET_EXPECTED_RETURN
+    )
+    if aggressive_alpha_ok:
+        return "simulate_long", "aggressive_alpha_override:" + ",".join(block_reasons)
+
     if block_reasons:
         return "no_operate", ",".join(block_reasons)
     return "simulate_long", None
@@ -492,11 +542,12 @@ def build_paper_trading_signals(
             "strategy_gate": strategy_gate,
             "signal_version": PAPER_SIGNAL_VERSION,
         }
-        operational_action = (
-            OPERATIONAL_ACTION_LEGACY_SIMULATE
-            if decision == "simulate_long"
-            else OPERATIONAL_ACTION_LEGACY_BLOCK
-        )
+        if decision == "simulate_long":
+            operational_action = OPERATIONAL_ACTION_ENTER_LONG
+        elif probability_up >= 0.40 and net_expected_return > -policy.total_execution_drag:
+            operational_action = OPERATIONAL_ACTION_WATCHLIST
+        else:
+            operational_action = OPERATIONAL_ACTION_NO_TRADE
         signal_records.append(
             {
                 "signal_id": build_signal_id(run_id, row.ticker, row.date, policy.horizon),
@@ -565,6 +616,30 @@ def choose_operational_action(
         block_reasons.append("reward_risk_below_minimum")
 
     win_minus_loss = probability_win - probability_loss
+    expanded_block_reasons = _expand_block_reasons(block_reasons)
+    aggressive_hard_blocks = [
+        reason for reason in expanded_block_reasons if reason not in AGGRESSIVE_ALPHA_SOFT_BLOCK_REASONS
+    ]
+    aggressive_alpha_ok = (
+        bool(block_reasons)
+        and not aggressive_hard_blocks
+        and max_shares > 0
+        and volatility_21d <= policy.max_volatility_21d * AGGRESSIVE_ALPHA_MAX_VOLATILITY_MULTIPLIER
+        and reward_risk_ratio >= (policy.min_reward_risk_ratio - REWARD_RISK_TOLERANCE)
+        and effective_probability_win >= max(
+            AGGRESSIVE_ALPHA_MIN_EFFECTIVE_WIN_PROBABILITY,
+            enter_long_min_probability_win,
+        )
+        and win_minus_loss >= max(AGGRESSIVE_ALPHA_MIN_WIN_LOSS_EDGE, enter_long_min_edge)
+        and net_expected_return >= AGGRESSIVE_ALPHA_MIN_NET_EXPECTED_RETURN
+    )
+    if aggressive_alpha_ok:
+        return (
+            OPERATIONAL_ACTION_ENTER_LONG,
+            "simulate_long",
+            "aggressive_alpha_override:" + ",".join(block_reasons),
+        )
+
     enter_long_ok = (
         not block_reasons
         and effective_probability_win >= enter_long_min_probability_win
@@ -1329,12 +1404,20 @@ def generate_paper_trading_signals(
         data_staleness = {"is_stale": True, "reason": f"staleness_check_failed:{exc}"}
     trade_outcome_predictions = read_latest_operational_trade_outcomes()
     current_features = build_current_technical_features(prices)
-    if not trade_outcome_predictions.empty:
-        strategy_gate = (
-            build_trade_outcome_strategy_gate(trade_outcome_predictions)
-            if require_strategy_edge
-            else directional_strategy_gate
+    trade_outcome_strategy_gate = (
+        build_trade_outcome_strategy_gate(trade_outcome_predictions)
+        if (require_strategy_edge and not trade_outcome_predictions.empty)
+        else directional_strategy_gate
+    )
+    use_trade_outcome_predictions = (
+        not trade_outcome_predictions.empty
+        and (
+            not require_strategy_edge
+            or bool(trade_outcome_strategy_gate.get("passed"))
         )
+    )
+    if use_trade_outcome_predictions:
+        strategy_gate = trade_outcome_strategy_gate
         signals = build_trade_outcome_paper_signals(
             trade_outcome_predictions,
             current_features,
@@ -1357,17 +1440,24 @@ def generate_paper_trading_signals(
         else:
             predictions = operational_predictions.copy()
             features = current_features
-            signal_source = "operational_predictions"
-        strategy_gate = (
-            build_directional_strategy_gate(
-                run_id=selected_run_id,
-                holding_days=7,
-                cost_per_trade=cost_per_trade,
-                portfolio_value=portfolio_value,
+            signal_source = (
+                "operational_predictions_fallback_from_trade_outcomes"
+                if not trade_outcome_predictions.empty and require_strategy_edge
+                else "operational_predictions"
             )
-            if require_strategy_edge
-            else directional_strategy_gate
-        )
+        if require_strategy_edge and not trade_outcome_predictions.empty and not bool(trade_outcome_strategy_gate.get("passed")):
+            strategy_gate = trade_outcome_strategy_gate
+        else:
+            strategy_gate = (
+                build_directional_strategy_gate(
+                    run_id=selected_run_id,
+                    holding_days=7,
+                    cost_per_trade=cost_per_trade,
+                    portfolio_value=portfolio_value,
+                )
+                if require_strategy_edge
+                else directional_strategy_gate
+            )
         signals = build_paper_trading_signals(
             predictions,
             features,

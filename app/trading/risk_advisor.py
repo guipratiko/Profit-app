@@ -17,7 +17,8 @@ from app.data.database import (
 )
 
 
-RISK_ADVISOR_VERSION = "v2_conselheiro_ev_trailing_stop"
+RISK_ADVISOR_VERSION = "v3_conselheiro_alpha_profit_capture"
+ENTRY_OPERATIONAL_ACTIONS = {"ENTER_LONG", "LEGACY_SIMULATE_LONG"}
 
 # Map textual horizons used by paper signals to trading-day counts.
 HORIZON_TO_DAYS = {
@@ -74,17 +75,27 @@ def build_positions_from_signals(signals: pd.DataFrame | None = None) -> pd.Data
 
     signals = latest_signal_snapshot(signals)
 
-    simulated = signals[signals["decision"] == "simulate_long"].copy()
+    if "operational_action" not in signals.columns:
+        signals["operational_action"] = None
+    simulated = signals[
+        signals["decision"].eq("simulate_long")
+        | signals["operational_action"].isin(ENTRY_OPERATIONAL_ACTIONS)
+    ].copy()
     if simulated.empty:
         return pd.DataFrame()
 
     records: list[dict] = []
     for row in simulated.itertuples(index=False):
         quantity = int(row.max_shares)
+        if quantity <= 0:
+            continue
         entry_price = float(row.suggested_entry)
         metadata = {
             "risk_advisor_version": RISK_ADVISOR_VERSION,
             "source": "paper_trading_signal",
+            "operational_action": getattr(row, "operational_action", None),
+            "decision": getattr(row, "decision", None),
+            "block_reason": getattr(row, "block_reason", None),
         }
         records.append(
             {
@@ -369,6 +380,9 @@ def conselheiro_evaluate_position(
         realised_return=unrealised_return,
     )
 
+    profit_capture_return = max(0.018, target_distance * 0.35)
+    residual_ev_floor = max(execution_drag, 0.003)
+
     if current_price <= base_stop:
         action = "EXIT_STOP"
         severity = "critical"
@@ -398,6 +412,12 @@ def conselheiro_evaluate_position(
         severity = "high"
         reason = "residual_expected_value_non_positive"
         status = "closed_ev_negative"
+        realized_return = unrealised_return
+    elif unrealised_return >= profit_capture_return and residual_ev <= residual_ev_floor:
+        action = "EXIT_PROFIT_CAPTURE"
+        severity = "high"
+        reason = "profit_available_residual_edge_compressed"
+        status = "closed_profit_capture"
         realized_return = unrealised_return
     elif current_price >= partial_target:
         action = "REDUCE_PARTIAL"
