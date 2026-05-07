@@ -28,6 +28,7 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.cursor import CursorResult
+from sqlalchemy.pool import NullPool
 
 
 # Conflict targets for INSERT OR REPLACE rewriting (table -> conflict columns).
@@ -72,13 +73,30 @@ def get_engine() -> Engine:
         if _engine is not None:
             return _engine
         url = _build_database_url()
-        engine = create_engine(
-            url,
-            future=True,
-            pool_pre_ping=True,
-            pool_size=5,
-            max_overflow=10,
+        nullpool = os.getenv("PROFIT_APP_SQLALCHEMY_NULLPOOL", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         )
+        if nullpool:
+            # Sem pool persistente: evita 500 no primeiro request após idle em PaaS
+            # (Easypanel recomenda evitar conexões mínimas presas). Ative com
+            # PROFIT_APP_SQLALCHEMY_NULLPOOL=1 em produção containerizada.
+            engine = create_engine(
+                url,
+                future=True,
+                pool_pre_ping=True,
+                poolclass=NullPool,
+            )
+        else:
+            engine = create_engine(
+                url,
+                future=True,
+                pool_pre_ping=True,
+                pool_size=5,
+                max_overflow=10,
+            )
         _engine = engine
         return _engine
 
