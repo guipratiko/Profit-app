@@ -201,7 +201,7 @@ function badgeTone(value?: string | null): Tone {
 function actionLabel(action?: string | null) {
   if (!action) return "N/A";
   if (action === "ENTER_LONG") return "Comprar";
-  if (action === "WATCHLIST") return "Observar";
+  if (action === "WATCHLIST") return "Nao operar";
   if (action === "NO_TRADE") return "Nao operar";
   return action.replaceAll("_", " ");
 }
@@ -304,7 +304,7 @@ function decisionExplanation(
     return "Entrada vetada pela volatilidade: o stop precisaria ficar largo demais para o risco atual.";
   }
   if (hasTechnicalValidation) {
-    return "Entrada vetada porque o padrao ainda nao provou retorno liquido consistente nos testes recentes. Observar ate o edge aparecer com mais robustez.";
+    return "Entrada vetada porque o padrao ainda nao provou retorno liquido consistente nos testes recentes. Aguardar ate o edge aparecer com mais robustez.";
   }
   if (hasWeakProbability || hasWeakEdge) {
     return "Entrada vetada porque a vantagem estatistica ainda esta pequena para justificar risco real.";
@@ -351,19 +351,51 @@ function horizonLabel(signal?: PaperSignal | null, alertMeta?: Record<string, an
 function signalIntent(signal?: PaperSignal | null): { label: string; tone: Tone } {
   const action = String(signal?.operational_action || signal?.decision || "").toUpperCase();
   if (action.includes("ENTER") || action.includes("SIMULATE_LONG")) return { label: "Comprar", tone: "good" };
-  if (action.includes("WATCH")) return { label: "Observar", tone: "warn" };
-  if (action.includes("NO_TRADE") || action.includes("NO_OPERATE")) return { label: "Nao entrar", tone: "bad" };
+  if (action.includes("WATCH")) return { label: "Nao operar", tone: "warn" };
+  if (action.includes("NO_TRADE") || action.includes("NO_OPERATE")) return { label: "Nao operar", tone: "bad" };
   return { label: actionLabel(signal?.operational_action || signal?.decision), tone: badgeTone(signal?.operational_action || signal?.decision) };
 }
 
-function positionIntent(alert?: RiskAlert | null): { label: string; tone: Tone } {
+function positionIntent(signal?: PaperSignal | null, alert?: RiskAlert | null): { label: string; tone: Tone } {
   const action = String(alert?.action || "").toUpperCase();
   if (action.includes("EXIT_TARGET")) return { label: "Realizar no alvo", tone: "good" };
   if (action.includes("EXIT") || action.includes("CLOSE")) return { label: "Vender", tone: "bad" };
   if (action.includes("REDUCE") || action.includes("PARTIAL")) return { label: "Realizar parcial", tone: "warn" };
   if (action.includes("MANAGE") || action.includes("ADJUST")) return { label: "Manter com ajuste", tone: "warn" };
+  if (String(signal?.operational_action || "").toUpperCase() === "ENTER_LONG" && Number(signal?.net_expected_return || 0) >= 0.03) {
+    return { label: "Comprar mais", tone: "good" };
+  }
   if (action.includes("HOLD")) return { label: "Manter", tone: "good" };
   return { label: actionLabel(alert?.action), tone: badgeTone(alert?.action) };
+}
+
+function actionExplanation(
+  inPortfolio: boolean,
+  intentLabel: string,
+  signal?: PaperSignal | null,
+  alert?: RiskAlert | null,
+) {
+  if (!inPortfolio) {
+    if (intentLabel === "Comprar") {
+      return `Comprar: nao ha posicao aberta e o sinal liberou entrada com EV liquido de ${fmtPercent(signal?.net_expected_return, 2)}.`;
+    }
+    return decisionExplanation(
+      signal?.block_reason,
+      signal,
+      "Nao operar: ainda nao ha entrada autorizada para este ativo no snapshot atual."
+    );
+  }
+
+  if (intentLabel === "Comprar mais") {
+    return `Comprar mais: o ativo ja esta em carteira e o sinal continua comprado, com EV liquido de ${fmtPercent(signal?.net_expected_return, 2)}; o Conselheiro nao acionou saida.`;
+  }
+  if (intentLabel.includes("Vender") || intentLabel.includes("Realizar")) {
+    return decisionExplanation(alert?.reason, signal, "Vender: o Conselheiro detectou perda de edge, alvo, stop ou reducao de risco.");
+  }
+  if (intentLabel.includes("ajuste")) {
+    return "Manter com ajuste: posicao em carteira, mas o lucro ou volatilidade pede stop mais justo.";
+  }
+  return "Manter: ativo em carteira, risco dentro da politica e sem gatilho de venda ou reforco neste snapshot.";
 }
 
 function classifyIntentLabel(label?: string | null): IntentFilter | null {
@@ -431,7 +463,7 @@ function nextReviewLabel(position: Position | undefined, signal: PaperSignal | n
   }
   const action = String(signal?.operational_action || signal?.decision || "").toUpperCase();
   if (action.includes("ENTER")) return signal?.signal_date ? `Entrada desde ${formatShortDate(signal.signal_date)}` : "Entrada no proximo fechamento";
-  if (action.includes("WATCH")) return "Observar no proximo fechamento";
+  if (action.includes("WATCH")) return releaseCondition(signal?.block_reason) || "Reavaliar no proximo fechamento";
   if (signal?.block_reason) return releaseCondition(signal.block_reason) || "Aguardar confirmacao objetiva do edge";
   return "Sem gatilho ativo";
 }
@@ -689,15 +721,9 @@ export default function Page() {
       const alert = latestAlert(state.alerts, asset.ticker);
       const alertMeta = parseJson<Record<string, any>>(alert?.metadata_json || null);
       const currentPositionOpen = position?.status === "open";
-      const intent = currentPositionOpen ? positionIntent(alert) : signalIntent(signal);
+      const intent = currentPositionOpen ? positionIntent(signal, alert) : signalIntent(signal);
       const status = positionState(position, signal);
-      const reasonLabel = currentPositionOpen
-        ? decisionExplanation(alert?.reason, signal, "Sem alerta ativo")
-        : decisionExplanation(
-            signal?.block_reason,
-            signal,
-            intent.label === "Comprar" ? "Sem bloqueios e com edge positivo" : "Sem bloqueio explicito"
-          );
+      const reasonLabel = actionExplanation(currentPositionOpen, intent.label, signal, alert);
 
       return {
         asset,
