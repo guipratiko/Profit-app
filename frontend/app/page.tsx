@@ -432,7 +432,7 @@ function nextReviewLabel(position: Position | undefined, signal: PaperSignal | n
   const action = String(signal?.operational_action || signal?.decision || "").toUpperCase();
   if (action.includes("ENTER")) return signal?.signal_date ? `Entrada desde ${formatShortDate(signal.signal_date)}` : "Entrada no proximo fechamento";
   if (action.includes("WATCH")) return "Observar no proximo fechamento";
-  if (signal?.block_reason) return "Aguardar melhora dos filtros";
+  if (signal?.block_reason) return releaseCondition(signal.block_reason) || "Aguardar confirmacao objetiva do edge";
   return "Sem gatilho ativo";
 }
 
