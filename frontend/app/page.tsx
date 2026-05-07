@@ -370,6 +370,7 @@ function positionIntent(signal?: PaperSignal | null, alert?: RiskAlert | null): 
     return { label: "Comprar mais", tone: "good" };
   }
   if (action.includes("HOLD")) return { label: "Manter", tone: "good" };
+  if (!action) return { label: "Manter", tone: "good" };
   return { label: actionLabel(alert?.action), tone: badgeTone(alert?.action) };
 }
 
