@@ -23,6 +23,7 @@ import re
 import threading
 from contextlib import contextmanager
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import quote_plus
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -50,12 +51,33 @@ _engine_lock = threading.Lock()
 _engine: Engine | None = None
 
 
+def _database_url_from_pg_env() -> str | None:
+    """Monta URL a partir de variáveis PG* / POSTGRES_* (Docker, Easypanel, etc.)."""
+    host = os.getenv("PGHOST") or os.getenv("POSTGRES_HOST")
+    user = os.getenv("PGUSER") or os.getenv("POSTGRES_USER")
+    password = os.getenv("PGPASSWORD") or os.getenv("POSTGRES_PASSWORD")
+    database = os.getenv("PGDATABASE") or os.getenv("POSTGRES_DB")
+    port = os.getenv("PGPORT") or os.getenv("POSTGRES_PORT") or "5432"
+    if not host or not user or database is None:
+        return None
+    if password is None:
+        return None
+    u = quote_plus(user)
+    p = quote_plus(password)
+    return f"postgresql+psycopg://{u}:{p}@{host}:{port}/{database}"
+
+
 def _build_database_url() -> str:
     url = os.getenv("DATABASE_URL") or os.getenv("PROFIT_APP_DATABASE_URL")
     if not url:
+        url = _database_url_from_pg_env()
+    if not url:
         raise RuntimeError(
             "DATABASE_URL is required (PostgreSQL). Example: "
-            "postgresql+psycopg://user:pass@host:5432/dbname"
+            "postgresql+psycopg://user:pass@host:5432/dbname. "
+            "Alternativa: defina PGHOST, PGUSER, PGPASSWORD, PGDATABASE "
+            "(ou POSTGRES_HOST, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB); "
+            "PGPORT / POSTGRES_PORT opcionais (default 5432)."
         )
     # Normalize bare postgres:// (Heroku-style) to SA's postgresql+psycopg://
     if url.startswith("postgres://"):
