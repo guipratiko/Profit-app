@@ -26,7 +26,23 @@ RUN pip install --upgrade pip \
 
 COPY app ./app
 COPY storage ./storage_seed
-COPY --chmod=755 scripts/start_backend.sh ./scripts/start_backend.sh
+
+# Gerado na imagem (evita COPY de scripts/ quando o contexto no Easypanel vem incompleto).
+RUN mkdir -p scripts \
+    && printf '%s\n' \
+        '#!/bin/sh' \
+        'set -eu' \
+        '' \
+        'if [ -n "${PROFIT_APP_STORAGE_DIR:-}" ]; then' \
+        '  mkdir -p "${PROFIT_APP_STORAGE_DIR}"' \
+        '  if [ -d "/app/storage_seed" ]; then' \
+        '    cp -an /app/storage_seed/. "${PROFIT_APP_STORAGE_DIR}/" 2>/dev/null || true' \
+        '  fi' \
+        'fi' \
+        '' \
+        'exec uvicorn app.api:app --host 0.0.0.0 --port "${PORT:-8000}"' \
+        > scripts/start_backend.sh \
+    && chmod +x scripts/start_backend.sh
 
 EXPOSE 8000
 
