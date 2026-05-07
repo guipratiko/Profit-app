@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from datetime import datetime
@@ -11,10 +12,12 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import OperationalError
 
 from app.config import INITIAL_ASSETS
 from app.data.company_branding import LOGO_CACHE_TTL, asset_branding_record, get_company_logo
 from app.data.database import (
+    DATABASE_PATH,
     get_fusion_predictions,
     get_news_events,
     get_paper_trading_signals,
@@ -23,6 +26,7 @@ from app.data.database import (
     get_qualitative_features,
     get_real_positions,
     get_risk_alerts,
+    get_connection,
     initialize_database,
     read_model_predictions,
     read_operational_predictions,
@@ -319,6 +323,7 @@ DASHBOARD_HTML = """
     <script>
         const fmt = new Intl.NumberFormat('pt-BR', { maximumFractionDigits: 4 });
         async function getJson(url, options) { const res = await fetch(url, options); if (!res.ok) throw new Error(await res.text()); return res.json(); }
+        async function getJsonOrNull(url) { const res = await fetch(url); if (res.status === 404) return null; if (!res.ok) throw new Error(await res.text()); return res.json(); }
         function table(rows, cols) {
             if (!rows || rows.length === 0) return '<p class="muted">Sem dados.</p>';
             return '<table><thead><tr>' + cols.map(c => `<th>${c[0]}</th>`).join('') + '</tr></thead><tbody>' +
@@ -334,9 +339,14 @@ DASHBOARD_HTML = """
         }
         async function loadTicker(ticker) {
             const [prediction, prices, explanation, metrics, portfolio, alerts] = await Promise.all([
-                getJson(`/predictions/${ticker}`), getJson(`/prices/${ticker}?limit=8`), getJson(`/predictions/${ticker}/explanation`),
-                getJson('/paper/metrics'), getJson('/portfolio/positions'), getJson('/portfolio/alerts')
+                getJson(`/predictions/${ticker}`),
+                getJsonOrNull(`/prices/${ticker}?limit=8`),
+                getJson(`/predictions/${ticker}/explanation`),
+                getJson('/paper/metrics'),
+                getJson('/portfolio/positions'),
+                getJson('/portfolio/alerts')
             ]);
+            const priceRows = (prices && prices.rows) ? prices.rows : [];
             document.getElementById('metrics').innerHTML = [
                 ['Sinais', metrics.signals], ['Simulados', metrics.simulate_long], ['Bloqueados', metrics.no_operate]
             ].map(m => `<div class="metric"><span class="muted">${m[0]}</span><strong>${m[1]}</strong></div>`).join('');
@@ -346,10 +356,12 @@ DASHBOARD_HTML = """
                 ticker, direction: fusion.fused_direction, score: fmt.format(fusion.fused_score || 0), decision: paper.decision,
                 reason: paper.block_reason, entry: paper.suggested_entry, stop: paper.stop_loss, target: paper.target_price, shares: paper.max_shares
             }], [['Ativo','ticker'], ['Direcao','direction'], ['Score','score'], ['Decisao','decision'], ['Motivo','reason'], ['Entrada','entry'], ['Stop','stop'], ['Alvo','target'], ['Qtd max','shares']]);
-            document.getElementById('prices').innerHTML = table(prices.rows, [['Data','date'], ['Fechamento','close'], ['Volume','volume']]);
+            document.getElementById('prices').innerHTML = table(priceRows, [['Data','date'], ['Fechamento','close'], ['Volume','volume']]);
             document.getElementById('portfolio').innerHTML = table(portfolio.positions, [['Ativo','ticker'], ['Status','status'], ['Entrada','entry_price'], ['Atual','current_price'], ['Retorno','unrealized_return']]);
             document.getElementById('alerts').innerHTML = table(alerts.alerts, [['Ativo','ticker'], ['Acao','action'], ['Severidade','severity'], ['Motivo','reason'], ['Retorno','unrealized_return']]);
-            document.getElementById('explanation').textContent = JSON.stringify(explanation.explanation, null, 2);
+            document.getElementById('explanation').textContent = explanation && explanation.explanation != null
+                ? JSON.stringify(explanation.explanation, null, 2)
+                : 'Sem explicacao de fusao para este ativo (ainda nao ha dados em fusion_predictions).';
         }
         async function auditRisk() { await getJson('/portfolio/audit', {method:'POST'}); await loadTicker(document.getElementById('assetSelect').value); }
         loadAssets().catch(err => { document.getElementById('explanation').textContent = err.message; });
@@ -361,7 +373,18 @@ DASHBOARD_HTML = """
 
 @app.on_event("startup")
 def startup() -> None:
-    initialize_database()
+    try:
+        initialize_database()
+    except OperationalError as exc:
+        msg = str(exc).lower()
+        if "password authentication failed" in msg:
+            logging.getLogger(__name__).error(
+                "PostgreSQL: password recusada. No Easypanel confirme que a password em "
+                "DATABASE_URL coincide com a do serviço Postgres. Se existir PGPASSWORD ou "
+                "POSTGRES_PASSWORD, a app substitui a password na URL (desligue com "
+                "PROFIT_APP_DATABASE_URL_MERGE_PASSWORD=0 se não quiser este comportamento)."
+            )
+        raise
 
 
 @app.get("/health")
@@ -370,6 +393,20 @@ def health() -> dict:
         "status": "ok",
         "mode": "production",
     }
+
+
+@app.get("/ready")
+def ready() -> dict:
+    """Readiness: confirma ligação à base de dados (use no proxy / Easypanel além de /health)."""
+    try:
+        with get_connection(DATABASE_PATH) as conn:
+            conn.execute("SELECT 1")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "not_ready", "database": str(exc)[:500]},
+        ) from exc
+    return {"status": "ok", "database": "ok"}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -523,7 +560,7 @@ def prediction_snapshot() -> dict:
 def prediction_explanation(ticker: str) -> dict:
     fusion_latest = latest_row(get_fusion_predictions(), ticker)
     if fusion_latest is None:
-        raise HTTPException(status_code=404, detail=f"No fusion explanation found for {ticker}")
+        return {"ticker": ticker, "explanation": None, "status": "no_fusion_explanation"}
     explanation = json.loads(str(fusion_latest["explanation_json"]))
     return {"ticker": ticker, "explanation": explanation}
 

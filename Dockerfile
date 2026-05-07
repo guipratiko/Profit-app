@@ -68,6 +68,6 @@ RUN mkdir -p scripts \
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=45s --retries=3 \
-    CMD python -c "import json,os,sys,urllib.request;p=os.environ.get('PORT','8000');r=urllib.request.urlopen('http://127.0.0.1:'+p+'/health');d=json.load(r);sys.exit(0 if d.get('status')=='ok' else 1)"
+    CMD python -c "import sys,urllib.request,os;p=os.environ.get('PORT','8000');urllib.request.urlopen('http://127.0.0.1:'+p+'/ready',timeout=5);sys.exit(0)"
 
 CMD ["./scripts/start_backend.sh"]

@@ -85,6 +85,22 @@ def _build_database_url() -> str:
         url = "postgresql+psycopg://" + url[len("postgres://") :]
     elif url.startswith("postgresql://"):
         url = "postgresql+psycopg://" + url[len("postgresql://") :]
+    # Easypanel: DATABASE_URL por vezes fica desatualizado; PGPASSWORD ligado ao Postgres costuma estar certo.
+    merge_pw = os.getenv("PROFIT_APP_DATABASE_URL_MERGE_PASSWORD", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    if merge_pw:
+        env_pw = os.getenv("PGPASSWORD")
+        if env_pw is None:
+            env_pw = os.getenv("POSTGRES_PASSWORD")
+        if env_pw is not None:
+            try:
+                parsed = make_url(url)
+                url = parsed.set(password=env_pw).render_as_string(hide_password=False)
+            except Exception:
+                pass
     # Re-render com user/password codificados (evita falhas com @ : / na password).
     try:
         url = make_url(url).render_as_string(hide_password=False)
