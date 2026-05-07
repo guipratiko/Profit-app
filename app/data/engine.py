@@ -28,6 +28,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.engine.cursor import CursorResult
 from sqlalchemy.pool import NullPool
 
@@ -84,6 +85,11 @@ def _build_database_url() -> str:
         url = "postgresql+psycopg://" + url[len("postgres://") :]
     elif url.startswith("postgresql://"):
         url = "postgresql+psycopg://" + url[len("postgresql://") :]
+    # Re-render com user/password codificados (evita falhas com @ : / na password).
+    try:
+        url = make_url(url).render_as_string(hide_password=False)
+    except Exception:
+        pass
     return url
 
 
