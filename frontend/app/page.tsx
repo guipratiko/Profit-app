@@ -296,7 +296,7 @@ function positionIntent(alert?: RiskAlert | null): { label: string; tone: Tone }
 
 function classifyIntentLabel(label?: string | null): IntentFilter | null {
   const normalized = String(label || "").toLowerCase();
-  if (normalized.includes("comprar") || normalized.includes("entrada") || normalized.includes("observar") || normalized.includes("watch")) return "BUY";
+  if (normalized.includes("comprar") || normalized.includes("entrada")) return "BUY";
   if (normalized.includes("vender") || normalized.includes("realizar") || normalized.includes("parcial")) return "SELL";
   if (normalized.includes("nao") || normalized.includes("não") || normalized.includes("bloque")) return "NO_OPERATE";
   return null;
