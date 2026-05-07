@@ -1623,7 +1623,7 @@ export default function Page() {
                     <div>
                       <CardTitle>Carteira real cadastrada</CardTitle>
                       <div className="mt-1 text-xs text-muted-foreground">
-                        Posicoes manuais com edicao direta na linha e atualizacao pelo ultimo fechamento disponivel.
+                        Posições manuais com edição direta na linha e atualização pelo último fechamento disponível.
                       </div>
                     </div>
                     <div className="flex w-full flex-col items-start gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
@@ -1637,7 +1637,7 @@ export default function Page() {
                     </div>
                   </CardHeader>
                   <CardContent className="p-0">
-                    {filteredRealPortfolioRows.length === 0 && <div className="p-6 text-sm text-muted-foreground">Nenhuma posicao real neste filtro.</div>}
+                    {filteredRealPortfolioRows.length === 0 && <div className="p-6 text-sm text-muted-foreground">Nenhuma posição real neste filtro.</div>}
                     {filteredRealPortfolioRows.length > 0 && (
                       <div className="space-y-3 p-4 lg:hidden">
                         {filteredRealPortfolioRows.map((row) => {
@@ -1685,7 +1685,7 @@ export default function Page() {
                                 <div className="mt-1 text-xs text-muted-foreground">{intent?.timeLabel || row.timeLabel}</div>
                               </div>
                               <div className="mt-3 rounded-xl border border-white/10 bg-white/[0.03] p-3 text-sm">
-                                <div className="text-xs uppercase tracking-wider text-muted-foreground">Observacao</div>
+                                <div className="text-xs uppercase tracking-wider text-muted-foreground">Observação</div>
                                 <div className="mt-2 leading-6 text-foreground">{intent?.reasonLabel || row.reasonLabel}</div>
                               </div>
                               <div className="mt-3 flex flex-wrap gap-2">
@@ -1718,19 +1718,19 @@ export default function Page() {
                       </div>
                     )}
                     <div className="hidden overflow-x-auto scrollbar-thin lg:block">
-                    <table className="w-full min-w-[1260px] border-collapse text-sm">
+                    <table className="w-full min-w-[1480px] table-fixed border-collapse text-sm">
                       <thead className="bg-white/[0.04] text-[11px] uppercase tracking-wider text-muted-foreground">
                         <tr>
-                          <th className="w-[230px] px-4 py-3 text-left font-medium">Ativo</th>
-                          <th className="w-[110px] px-4 py-3 text-right font-medium">Qtd</th>
+                          <th className="w-[220px] px-4 py-3 text-left font-medium">Ativo</th>
+                          <th className="w-[105px] px-4 py-3 text-right font-medium">Qtd</th>
                           <th className="w-[150px] px-4 py-3 text-right font-medium">Compra</th>
                           <th className="w-[190px] px-4 py-3 text-left font-medium">Data/hora</th>
-                          <th className="px-4 py-3 text-right font-medium">Atual</th>
-                          <th className="px-4 py-3 text-right font-medium">P/L</th>
-                          <th className="px-4 py-3 text-left font-medium">Intencao atual</th>
-                          <th className="px-4 py-3 text-left font-medium">Quando revisar</th>
-                          <th className="w-[260px] px-4 py-3 text-left font-medium">Observacao</th>
-                          <th className="w-[132px] px-4 py-3 text-right font-medium">Acoes</th>
+                          <th className="w-[135px] px-4 py-3 text-right font-medium">Atual</th>
+                          <th className="w-[135px] px-4 py-3 text-right font-medium">P/L</th>
+                          <th className="w-[150px] px-4 py-3 text-left font-medium">Intenção atual</th>
+                          <th className="w-[220px] px-4 py-3 text-left font-medium">Quando revisar</th>
+                          <th className="w-[240px] px-4 py-3 text-left font-medium">Observação</th>
+                          <th className="w-[135px] px-4 py-3 text-right font-medium">Ações</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1815,18 +1815,21 @@ export default function Page() {
                               </td>
                               <td className="px-4 py-3"><Badge tone={draftIntent?.intentTone || row.intentTone}>{draftIntent?.intentLabel || row.intentLabel}</Badge></td>
                               <td className="px-4 py-3 text-sm">
-                                <div>{draftIntent?.whenLabel || row.whenLabel}</div>
+                                <div className="line-clamp-3 leading-5 text-foreground" title={draftIntent?.whenLabel || row.whenLabel}>{draftIntent?.whenLabel || row.whenLabel}</div>
                                 <div className="text-xs text-muted-foreground">{draftIntent?.timeLabel || row.timeLabel}</div>
                               </td>
                               <td className="px-4 py-3">
                                 <textarea
-                                  rows={2}
+                                  rows={3}
                                   value={draft.notes}
                                   onClick={(event) => event.stopPropagation()}
                                   onChange={(event) => updateRealDraft(row.position.position_id, { notes: event.target.value })}
-                                  className="w-full resize-none rounded-lg border border-white/10 bg-white/5 px-2.5 py-2 text-sm text-foreground outline-none focus:border-sky-400/50"
-                                  placeholder={draftIntent?.reasonLabel || row.reasonLabel}
+                                  className="w-full resize-none rounded-lg border border-white/10 bg-white/5 px-2.5 py-2 text-xs leading-5 text-foreground outline-none focus:border-sky-400/50"
+                                  placeholder="Observação da entrada"
                                 />
+                                <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-muted-foreground" title={draftIntent?.reasonLabel || row.reasonLabel}>
+                                  {draftIntent?.reasonLabel || row.reasonLabel}
+                                </div>
                               </td>
                               <td className="px-4 py-3 text-right">
                                 <div className="flex justify-end gap-2">
