@@ -18,6 +18,9 @@ RUN set -eux \
 
 FROM python:3.11-slim
 
+# Runtime (Easypanel → Environment): define DATABASE_URL ou PGHOST+PGUSER+PGPASSWORD+PGDATABASE
+# (não coloques segredos aqui). Exemplos: ficheiro .env.example no repositório e em /app/.env.example na imagem.
+
 ARG GIT_SHA=unknown
 LABEL org.opencontainers.image.title="profit-app-api" \
       org.opencontainers.image.revision="${GIT_SHA}"
@@ -44,6 +47,7 @@ RUN pip install --upgrade pip \
 
 COPY --from=src /repo/app ./app
 COPY --from=src /repo/storage ./storage_seed
+COPY --from=src /repo/.env.example ./.env.example
 
 RUN mkdir -p scripts \
     && printf '%s\n' \
