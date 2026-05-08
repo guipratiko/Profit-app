@@ -142,7 +142,15 @@ def assign_time_split(features: pd.DataFrame) -> pd.DataFrame:
         ] = "validation"
         split_frames.append(ordered_features)
 
-    return pd.concat(split_frames, ignore_index=True) if split_frames else features
+    if not split_frames:
+        # Sem linhas (histórico curto → dropna remove tudo) ou sem grupos: garantir coluna time_split
+        # para o caller poder reindexar / persistir sem KeyError.
+        out = features.copy()
+        if "time_split" not in out.columns:
+            out["time_split"] = pd.Series(dtype="string")
+        return out
+
+    return pd.concat(split_frames, ignore_index=True)
 
 
 def build_technical_features(prices: pd.DataFrame) -> pd.DataFrame:
